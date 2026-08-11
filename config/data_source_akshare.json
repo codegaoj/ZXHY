@@ -1,0 +1,11 @@
+{
+  "source": "akshare",
+  "adjust": "qfq",
+  "akshare_retries": 3,
+  "akshare_pause_seconds": 1.0,
+  "history_days": 180,
+  "watchlist_path": "data/watchlist_real.csv",
+  "market_snapshot_path": "data/market_snapshot_akshare.csv",
+  "market_breadth_source": "compass_csv",
+  "compass_active_market_value_path": "data/compass_active_market_value.csv"
+}

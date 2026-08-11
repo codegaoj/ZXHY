@@ -1,0 +1,10 @@
+{
+  "source": "csv",
+  "adjust": "qfq",
+  "history_days": 180,
+  "watchlist_path": "data/watchlist.csv",
+  "market_snapshot_path": "data/market_snapshot.csv",
+  "demo_snapshot_path": "data/demo_market_snapshot.csv",
+  "market_breadth_source": "compass_csv",
+  "compass_active_market_value_path": "data/compass_active_market_value.csv"
+}

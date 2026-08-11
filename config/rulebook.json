@@ -1,0 +1,41 @@
+{
+  "market_timing": {
+    "bull_threshold": 4.0,
+    "bear_threshold": -2.3,
+    "macd_zero_axis_required_for_aggressive": true,
+    "cumulative_days": 3,
+    "cumulative_threshold": 4.0
+  },
+  "position_policy": {
+    "bull": {"max_position_pct": 80, "single_symbol_pct": 20},
+    "neutral": {"max_position_pct": 50, "single_symbol_pct": 12},
+    "bear": {"max_position_pct": 10, "single_symbol_pct": 3}
+  },
+  "risk_priority": [
+    "盈转亏",
+    "初始止损",
+    "S1/卖点",
+    "滴滴战法",
+    "破白线",
+    "破黄线",
+    "MACD否决",
+    "放飞/止盈"
+  ],
+  "tag_signal_map": {
+    "B1/B2买点": {"direction": "entry", "base_score": 20},
+    "关键K": {"direction": "entry_or_exit", "base_score": 12},
+    "底部暴力K": {"direction": "entry", "base_score": 18},
+    "量价关系": {"direction": "entry", "base_score": 12},
+    "双线/白黄线": {"direction": "support", "base_score": 14},
+    "砖形图": {"direction": "timing", "base_score": 12},
+    "单针战法": {"direction": "entry", "base_score": 14},
+    "S1/卖点": {"direction": "exit", "base_score": 25},
+    "滴滴战法": {"direction": "risk", "base_score": 20},
+    "筹码/主力": {"direction": "context", "base_score": 8},
+    "择时/大盘": {"direction": "market", "base_score": 10},
+    "板块/主线": {"direction": "context", "base_score": 10},
+    "仓位/风控": {"direction": "risk", "base_score": 15},
+    "MACD": {"direction": "veto", "base_score": 15},
+    "BBI/MA60": {"direction": "context", "base_score": 6}
+  }
+}
