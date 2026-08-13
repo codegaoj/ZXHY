@@ -8,7 +8,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -22,6 +22,9 @@ from trading_system.data_normalizer import WatchSymbol, build_snapshot
 from trading_system.engines import TradePlanEngine
 from trading_system.indicators import is_macd_bullish
 from trading_system.rulebook import Rulebook
+from trading_system.chart_quality import evaluate_chart_quality
+from trading_system.agent_review import review_candidates
+from trading_system.sector_analyzer import build_sector_mapping, fetch_sector_performance, get_sector_info, sector_strength_score
 
 
 DEFAULT_ACTIVE_MARKET_VALUE_PCT = 4.82
@@ -107,13 +110,31 @@ def to_float(value, default=0.0) -> float:
 
 def load_spot() -> pd.DataFrame:
     cache_path = PROJECT_ROOT / "data" / "a_spot_latest.csv"
+    today = date.today()
+    cache_is_today = False
     if cache_path.exists():
+        mtime = datetime.fromtimestamp(cache_path.stat().st_mtime).date()
+        if mtime == today:
+            cache_is_today = True
+
+    # 缓存是今天的，直接使用
+    if cache_is_today:
         df = pd.read_csv(cache_path, encoding="utf-8-sig")
         df["source"] = "cached_spot"
+        print(f"[行情缓存] 使用今日缓存文件：{cache_path}（修改日期：{today}）")
         return df
+
+    # 缓存过期或不存在，打印警告并尝试自动刷新
+    if cache_path.exists():
+        print(f"[警告] 行情缓存文件已过期（修改日期非今天 {today}），尝试自动刷新...")
+    else:
+        print("[提示] 行情缓存文件不存在，尝试拉取最新行情...")
+
     try:
         df = retry(lambda: ak.stock_zh_a_spot(), times=3, pause=2)
         df["source"] = "sina_spot"
+        df.to_csv(cache_path, index=False, encoding="utf-8-sig")
+        print(f"[行情缓存] 已刷新并保存到 {cache_path}，股票数：{len(df)}")
         return df
     except Exception as exc:
         print(f"新浪实时行情不可用，切换东方财富实时行情：{exc}")
@@ -134,15 +155,31 @@ def load_spot() -> pd.DataFrame:
         }
         df = df.rename(columns=rename)
         df["source"] = "eastmoney_spot"
+        df.to_csv(cache_path, index=False, encoding="utf-8-sig")
+        print(f"[行情缓存] 已刷新并保存到 {cache_path}，股票数：{len(df)}")
         return df
     except Exception as exc:
         print(f"东方财富实时行情不可用，切换代码表模式：{exc}")
-    codes = retry(lambda: ak.stock_info_a_code_name(), times=3, pause=1)
-    df = codes.rename(columns={"code": "代码", "name": "名称"}).copy()
-    for col in ["最新价", "涨跌额", "涨跌幅", "昨收", "今开", "最高", "最低", "成交量", "成交额"]:
-        df[col] = 0.0
-    df["source"] = "code_name_only"
-    return df
+    try:
+        codes = retry(lambda: ak.stock_info_a_code_name(), times=3, pause=1)
+        df = codes.rename(columns={"code": "代码", "name": "名称"}).copy()
+        for col in ["最新价", "涨跌额", "涨跌幅", "昨收", "今开", "最高", "最低", "成交量", "成交额"]:
+            df[col] = 0.0
+        df["source"] = "code_name_only"
+        df.to_csv(cache_path, index=False, encoding="utf-8-sig")
+        print(f"[行情缓存] 已刷新并保存到 {cache_path}，股票数：{len(df)}")
+        return df
+    except Exception as exc:
+        print(f"代码表模式也不可用：{exc}")
+
+    # 所有刷新尝试均失败，回退到缓存（如果有）
+    if cache_path.exists():
+        print(f"[警告] 行情刷新全部失败，回退使用缓存文件：{cache_path}")
+        df = pd.read_csv(cache_path, encoding="utf-8-sig")
+        df["source"] = "cached_spot"
+        return df
+
+    raise RuntimeError("无法获取行情数据：所有数据源均不可用，且无缓存文件可用")
 
 
 def filter_pool(spot: pd.DataFrame) -> pd.DataFrame:
@@ -289,7 +326,7 @@ def signal_text(plan) -> str:
     return "；".join(f"{sig.signal_type}:{sig.reason}" for sig in plan.entry_signals)
 
 
-def score_candidate(snapshot, plan, spot_row) -> tuple[float, str]:
+def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50) -> tuple[float, str]:
     close_above_lines = snapshot.close >= snapshot.white_line and snapshot.close >= snapshot.yellow_line
     macd_ok = is_macd_bullish(snapshot)
     no_risk = len(plan.risk_actions) == 0
@@ -331,6 +368,22 @@ def score_candidate(snapshot, plan, spot_row) -> tuple[float, str]:
     if "双线/白黄线" in tag_set:
         score += 8
         reasons.append("知行趋势达标")
+    # ---- 新增实战信号评分 ----
+    if "滴滴战法" in tag_set:
+        score += 15
+        reasons.append("滴滴战法（缩量后放量反弹）")
+    if "放量长阳" in tag_set:
+        score += 12
+        reasons.append("放量长阳关键K线")
+    if "锤头线" in tag_set:
+        score += 10
+        reasons.append("锤头线低位信号")
+    if "回踩白线" in tag_set:
+        score += 14
+        reasons.append("回踩白线反弹")
+    if "突破压力" in tag_set:
+        score += 13
+        reasons.append("突破20日压力位")
     if volume_ratio >= 1.2:
         score += min(10, (volume_ratio - 1.0) * 8)
         reasons.append(f"量能放大 {volume_ratio:.2f}x")
@@ -347,10 +400,21 @@ def score_candidate(snapshot, plan, spot_row) -> tuple[float, str]:
             score += min(8, distance_to_resistance)
             reasons.append(f"距压力位约 {distance_to_resistance:.1f}%")
 
+    # ---- 图形质量评分加分 ----
+    if chart_quality_score >= 80:
+        score += 10
+        reasons.append(f"图形质量优秀({chart_quality_score}分)")
+    elif chart_quality_score >= 60:
+        score += 6
+        reasons.append(f"图形质量良好({chart_quality_score}分)")
+    elif chart_quality_score < 40:
+        score -= 5
+        reasons.append(f"图形质量较差({chart_quality_score}分)")
+
     return round(score, 2), "；".join(reasons)
 
 
-def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: str, active_market_value_pct: float, recent_values: list[float] = None) -> dict | None:
+def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: str, active_market_value_pct: float, recent_values: list[float] = None, sector_mapping: dict[str, str] = None, sector_performance: dict[str, dict] = None) -> dict | None:
     symbol = row["symbol"]
     name = row["name"]
     try:
@@ -359,10 +423,18 @@ def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: s
             return None
         snapshot = build_snapshot(WatchSymbol(symbol=symbol, name=name, tags=[]), daily, active_market_value_pct, recent_values)
         plan = engine.build_plan(snapshot)
+        # 计算图形质量评分
+        cq = evaluate_chart_quality(daily)
         if float(row.get("amount", 0) or 0) <= 0:
             row["pct_change"] = snapshot.pct_change
             row["amount"] = 0.0
-        candidate_score, candidate_reason = score_candidate(snapshot, plan, row)
+        candidate_score, candidate_reason = score_candidate(snapshot, plan, row, cq.score)
+        # ---- 板块强度加分 ----
+        sector_info = get_sector_info(symbol, sector_mapping or {}, sector_performance or {})
+        sector_bonus = sector_strength_score(sector_info)
+        candidate_score += sector_bonus
+        if sector_info:
+            candidate_reason += f"；板块{sector_info.strength}({sector_info.sector_name}+{sector_info.sector_change}%)"
         if candidate_score < 25:
             return None
         return {
@@ -380,6 +452,8 @@ def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: s
             "macd_dif": snapshot.macd_dif,
             "macd_dea": snapshot.macd_dea,
             "tags": "；".join(snapshot.tags),
+            "chart_quality": cq.score,
+            "chart_grade": cq.grade,
             "plan_action": plan.action,
             "suggested_position_pct": plan.suggested_position_pct,
             "plan_score": plan.score,
@@ -387,6 +461,9 @@ def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: s
             "candidate_reason": candidate_reason,
             "risk": risk_text(plan),
             "signals": signal_text(plan),
+            "sector": sector_info.sector_name if sector_info else "未知",
+            "sector_strength": sector_info.strength if sector_info else "未知",
+            "sector_change": round(sector_info.sector_change, 2) if sector_info else 0.0,
         }
     except Exception:
         return None
@@ -408,6 +485,8 @@ def write_html(rows: list[dict], stats: dict, path: Path, active_market_value_pc
 
     tr = []
     for i, row in enumerate(rows, 1):
+        sector_strength = row.get("sector_strength", "未知")
+        strength_class = "st-strong" if sector_strength == "强势" else ("st-weak" if sector_strength == "弱势" else ("st-neutral" if sector_strength == "中性" else "st-unknown"))
         tr.append(f"""
         <tr>
           <td>{i}</td>
@@ -415,6 +494,8 @@ def write_html(rows: list[dict], stats: dict, path: Path, active_market_value_pc
           <td>{html.escape(row['name'])}</td>
           <td>{row['close']}</td>
           <td>{row['spot_pct_change']}%</td>
+          <td>{html.escape(str(row.get('sector', '未知')))}</td>
+          <td class="{strength_class}">{html.escape(str(sector_strength))}</td>
           <td>{fmt_amount(row['amount'])}</td>
           <td>{row['volume_ratio']}x</td>
           <td>{row['candidate_score']}</td>
@@ -444,15 +525,19 @@ def write_html(rows: list[dict], stats: dict, path: Path, active_market_value_pc
     h1 {{ margin: 0 0 8px; font-size: 30px; }}
     h2 {{ margin: 0 0 12px; font-size: 22px; }}
     p {{ color: var(--muted); margin: 0 0 12px; }}
-    .cards {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-top: 16px; }}
+    .cards {{ display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-top: 16px; }}
     .card {{ border: 1px solid var(--rule); border-radius: 12px; padding: 14px; background: var(--bg); }}
     .card span {{ display: block; color: var(--muted); font-size: 13px; }}
     .card strong {{ display: block; color: var(--accent); font-size: 24px; margin-top: 4px; }}
     .table-wrap {{ overflow: auto; max-height: 720px; border: 1px solid var(--rule); border-radius: 14px; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1180px; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1320px; }}
     th, td {{ padding: 10px; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: top; }}
     th {{ position: sticky; top: 0; background: var(--bg); color: var(--muted); z-index: 1; }}
     .code {{ font-family: Consolas, monospace; }}
+    .st-strong {{ color: #1a7f37; font-weight: 600; }}
+    .st-neutral {{ color: var(--muted); }}
+    .st-weak {{ color: var(--danger); font-weight: 600; }}
+    .st-unknown {{ color: var(--muted); }}
     .note {{ border-left: 4px solid var(--accent); padding: 12px 14px; background: var(--bg); border-radius: 10px; }}
     @media (max-width: 900px) {{ .cards {{ grid-template-columns: repeat(2, 1fr); }} }}
   </style>
@@ -468,11 +553,12 @@ def write_html(rows: list[dict], stats: dict, path: Path, active_market_value_pc
         <div class="card"><span>历史计算数</span><strong>{stats['prefilter_count']}</strong></div>
         <div class="card"><span>候选数</span><strong>{len(rows)}</strong></div>
         <div class="card"><span>活跃市值</span><strong>{active_market_value_pct}%</strong></div>
+        <div class="card"><span>行业板块数</span><strong>{stats.get('sector_count', 0)}</strong></div>
       </div>
     </header>
     <section>
       <h2>筛选口径</h2>
-      <p class="note">先排除 300/688、ST/退市、无成交票；再排除涨停附近、当日明显走弱和流动性过低股票；最后要求未触发破白/破黄/MACD 否决，且站上白线黄线、MACD 多头，并具备趋势或买点类标签。</p>
+      <p class="note">先排除 300/688、ST/退市、无成交票；再排除涨停附近、当日明显走弱和流动性过低股票；最后要求未触发破白/破黄/MACD 否决，且站上白线黄线、MACD 多头，并具备趋势或买点类标签。最终结合新浪行业板块强度进行加分（强势+8/中性+4/弱势-3）。</p>
     </section>
     <section>
       <h2>候选清单</h2>
@@ -480,7 +566,7 @@ def write_html(rows: list[dict], stats: dict, path: Path, active_market_value_pc
         <table>
           <thead>
             <tr>
-              <th>排名</th><th>代码</th><th>名称</th><th>收盘</th><th>涨跌幅</th><th>成交额</th><th>量比</th><th>候选分</th><th>系统动作</th><th>建议仓位</th><th>标签</th><th>入选理由</th>
+              <th>排名</th><th>代码</th><th>名称</th><th>收盘</th><th>涨跌幅</th><th>板块</th><th>强度</th><th>成交额</th><th>量比</th><th>候选分</th><th>系统动作</th><th>建议仓位</th><th>标签</th><th>入选理由</th>
             </tr>
           </thead>
           <tbody>{''.join(tr)}</tbody>
@@ -515,10 +601,17 @@ def main():
     rulebook = Rulebook.load(PROJECT_ROOT / "config" / "rulebook.json")
     engine = TradePlanEngine(rulebook)
 
+    # 板块分析（将预筛选股票代码传入，用CNINFO补充未覆盖的股票）
+    print("正在加载板块数据...")
+    supplement_symbols = [str(r.get("symbol", "")).strip().zfill(6) for r in pre.to_dict("records")]
+    sector_mapping = build_sector_mapping(PROJECT_ROOT / "data" / "sector_mapping.csv", supplement_symbols=supplement_symbols)
+    sector_performance = fetch_sector_performance()
+    print(f"板块映射: {len(sector_mapping)} 只股票, 行业表现: {len(sector_performance)} 个板块")
+
     rows = []
     records = pre.to_dict("records")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(process_one, row, engine, start_date, end_date, active_market_value_pct, recent_values) for row in records]
+        futures = [executor.submit(process_one, row, engine, start_date, end_date, active_market_value_pct, recent_values, sector_mapping, sector_performance) for row in records]
         for idx, future in enumerate(as_completed(futures), 1):
             result = future.result()
             if result:
@@ -531,6 +624,7 @@ def main():
         "raw_count": int(len(spot)),
         "pool_count": int(len(pool)),
         "prefilter_count": int(len(pre)),
+        "sector_count": int(len(sector_performance)),
         "watchlist_path": str(watchlist_path),
         "config_path": str(config_path),
     }
@@ -540,12 +634,62 @@ def main():
     daily_json = outputs / "daily_candidates.json"
     write_csv(rows, daily_csv)
     write_html(rows, stats, daily_html, active_market_value_pct)
-    daily_json.write_text(json.dumps({"stats": stats, "candidates": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+    today_str = date.today().isoformat()
+    daily_json.write_text(json.dumps({"date": today_str, "stats": stats, "candidates": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 保存带日期的历史备份到 history/ 目录（CSV + JSON + HTML）
+    history_dir = outputs / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    dated_csv = history_dir / f"daily_candidates_{today_str}.csv"
+    dated_json = history_dir / f"daily_candidates_{today_str}.json"
+    dated_html = history_dir / f"daily_candidates_{today_str}.html"
+    shutil.copyfile(daily_csv, dated_csv)
+    shutil.copyfile(daily_json, dated_json)
+    shutil.copyfile(daily_html, dated_html)
+    print(f"[历史] 已保存 {today_str} 的候选股记录到 history/ 目录")
 
     # 兼容旧版链接，避免之前的报告入口失效。
     shutil.copyfile(daily_csv, outputs / "next_monday_candidates.csv")
     shutil.copyfile(daily_html, outputs / "next_monday_candidates.html")
     shutil.copyfile(daily_json, outputs / "next_monday_candidates.json")
+
+    # ---- Agent 辅助审核 ----
+    try:
+        batch = review_candidates(rows)
+        review_data = {
+            "summary": batch.summary,
+            "warnings": batch.warnings,
+            "recommendations": batch.recommendations,
+            "stats": batch.stats,
+            "reviews": [
+                {
+                    "symbol": r.symbol,
+                    "name": r.name,
+                    "opinion": r.opinion,
+                    "issues": r.issues,
+                    "highlights": r.highlights,
+                    "score": r.score,
+                    "risk_reward": r.risk_reward,
+                    "risk_level": r.risk_level,
+                    "position_suggestion": r.position_suggestion,
+                    "brief": r.brief,
+                }
+                for r in batch.reviews
+            ],
+        }
+        review_path = outputs / "agent_review.json"
+        review_path.write_text(json.dumps(review_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n=== Agent 审核结果 ===")
+        print(batch.summary)
+        for w in batch.warnings:
+            print(f"  ⚠ {w}")
+        for rec in batch.recommendations:
+            print(f"  → {rec}")
+        opinion_counts = batch.stats.get("opinion_counts", {})
+        print(f"  建议关注: {opinion_counts.get('建议关注', 0)}  谨慎: {opinion_counts.get('谨慎', 0)}  排除: {opinion_counts.get('排除', 0)}")
+    except Exception as e:
+        print(f"Agent 审核失败: {e}")
+
     print(json.dumps({"stats": stats, "candidate_count": len(rows), "top": rows[:10]}, ensure_ascii=False, indent=2))
 
 

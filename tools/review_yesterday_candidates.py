@@ -51,18 +51,84 @@ def prefixed(symbol: str) -> str:
     return symbol
 
 
-def load_candidates() -> list[dict]:
-    path = PROJECT_ROOT / "outputs" / "daily_candidates.json"
-    if not path.exists():
+def load_candidates() -> tuple[list[dict], str]:
+    """加载「前一天」的候选股票数据。
+
+    查找策略：
+    1. 优先扫描 outputs/daily_candidates_YYYY-MM-DD.json，找到日期最早于今天的最新一份
+    2. 如果没有历史备份，回退到 daily_candidates.json，但检查其 date 字段是否为今天
+       （如果 date 是今天说明候选股已被今天的生成覆盖，此时给出警告）
+
+    返回 (candidates, source_date)。
+    """
+    outputs = PROJECT_ROOT / "outputs"
+    today = date.today()
+    today_str = today.isoformat()
+
+    # 1. 优先扫描 outputs/history/ 目录下的带日期历史备份
+    history_dir = outputs / "history"
+    dated_files = sorted(history_dir.glob("daily_candidates_*.json"), reverse=True) if history_dir.exists() else []
+    for f in dated_files:
+        # 从文件名提取日期：daily_candidates_2026-08-12.json
+        stem = f.stem  # daily_candidates_2026-08-12
+        date_part = stem.replace("daily_candidates_", "")
+        try:
+            file_date = date.fromisoformat(date_part)
+        except ValueError:
+            continue
+        if file_date < today:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            candidates = data.get("candidates", [])
+            if candidates:
+                print(f"[复盘] 加载历史候选股：{f.name}（选入日：{date_part}）")
+                return candidates, date_part
+
+    # 1.5 回退扫描 outputs/ 目录（旧格式备份）
+    dated_files_legacy = sorted(outputs.glob("daily_candidates_*.json"), reverse=True)
+    for f in dated_files_legacy:
+        stem = f.stem
+        date_part = stem.replace("daily_candidates_", "")
+        try:
+            file_date = date.fromisoformat(date_part)
+        except ValueError:
+            continue
+        if file_date < today:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            candidates = data.get("candidates", [])
+            if candidates:
+                print(f"[复盘] 加载历史候选股（旧格式）：{f.name}（选入日：{date_part}）")
+                return candidates, date_part
+
+    # 2. 回退到 daily_candidates.json，检查其日期
+    default_path = outputs / "daily_candidates.json"
+    if not default_path.exists():
         raise FileNotFoundError("未找到 outputs/daily_candidates.json，请先生成每日候选股票。")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(default_path.read_text(encoding="utf-8"))
+    file_date_str = data.get("date", "")
     candidates = data.get("candidates", [])
     if not candidates:
         raise RuntimeError("每日候选股票为空，请先重新生成候选股票。")
-    return candidates
+
+    if file_date_str == today_str:
+        print(f"[警告] daily_candidates.json 的日期是今天（{today_str}），"
+              f"可能已被今天的生成覆盖。复盘将对比今天的候选股与今天的行情，"
+              f"建议明天再复盘，或检查是否有历史备份文件。")
+    else:
+        print(f"[复盘] 加载候选股：daily_candidates.json（选入日：{file_date_str or '未知'}）")
+
+    return candidates, file_date_str or "未知"
+
+
+def fetch_spot_all() -> pd.DataFrame:
+    """一次性获取全市场实时行情（新浪源），含当日数据。"""
+    try:
+        return retry(lambda: ak.stock_zh_a_spot(), times=3, pause=2)
+    except Exception:
+        return pd.DataFrame()
 
 
 def fetch_daily(symbol: str) -> pd.DataFrame:
+    """获取个股历史日线（仅作为实时行情不可用时的回退）。"""
     end = date.today()
     start = end - timedelta(days=HISTORY_DAYS + 20)
     start_date = start.strftime("%Y%m%d")
@@ -75,25 +141,11 @@ def fetch_daily(symbol: str) -> pd.DataFrame:
                 end_date=end_date,
                 adjust="qfq",
             ),
-            times=3,
+            times=2,
             pause=1,
         )
     except Exception:
-        try:
-            return retry(
-                lambda: ak.stock_zh_a_hist(
-                    symbol=symbol,
-                    period="daily",
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust="qfq",
-                    timeout=8,
-                ),
-                times=2,
-                pause=1,
-            )
-        except Exception:
-            return pd.DataFrame()
+        return pd.DataFrame()
 
 
 def normalize_daily_row(row) -> dict:
@@ -126,17 +178,38 @@ def performance_category(value: float) -> str:
     return "弱势"
 
 
-def process_one(candidate: dict) -> dict:
+def process_one(candidate: dict, spot_df: pd.DataFrame | None = None) -> dict:
     symbol = candidate["symbol"]
-    daily = fetch_daily(symbol)
+    sym_with_prefix = prefixed(symbol)
 
     latest = {}
     previous_close = 0.0
-    if daily is not None and not daily.empty:
-        latest = normalize_daily_row(daily.iloc[-1])
-        if len(daily) >= 2:
-            previous = normalize_daily_row(daily.iloc[-2])
-            previous_close = previous["close"]
+
+    # 优先从实时行情中取今日数据
+    if spot_df is not None and not spot_df.empty and "代码" in spot_df.columns:
+        spot_row = spot_df[spot_df["代码"] == sym_with_prefix]
+        if spot_row.empty:
+            spot_row = spot_df[spot_df["代码"] == symbol]
+        if not spot_row.empty:
+            sr = spot_row.iloc[0]
+            latest = {
+                "date": str(date.today()),
+                "open": to_float(sr.get("今开")),
+                "high": to_float(sr.get("最高")),
+                "low": to_float(sr.get("最低")),
+                "close": to_float(sr.get("最新价")),
+                "amount": to_float(sr.get("成交额")),
+            }
+            previous_close = to_float(sr.get("昨收"))
+
+    # 实时行情没有时，回退到日线
+    if not latest or latest.get("close", 0.0) == 0.0:
+        daily = fetch_daily(symbol)
+        if daily is not None and not daily.empty:
+            latest = normalize_daily_row(daily.iloc[-1])
+            if len(daily) >= 2:
+                previous = normalize_daily_row(daily.iloc[-2])
+                previous_close = previous["close"]
 
     today_close = latest.get("close", 0.0)
     today_pct = round((today_close / previous_close - 1) * 100, 2) if today_close > 0 and previous_close > 0 else 0.0
@@ -323,8 +396,9 @@ def write_html(rows: list[dict], stats: dict, path: Path) -> None:
   <main>
     <header>
       <h1>每日候选股票复盘</h1>
-      <p>选入日基准来自 `outputs/daily_candidates.json`，复盘行情取最新前复权日线。报告用于验证候选票次日表现和破线风险，不构成投资建议。</p>
+      <p>选入日基准：{stats.get('selected_date', '未知')}，复盘行情取最新前复权日线。报告用于验证候选票次日表现和破线风险，不构成投资建议。</p>
       <div class="stats">
+        <div class="stat"><span>选入日期</span><strong style="font-size:18px;">{stats.get('selected_date', '未知')}</strong></div>
         <div class="stat"><span>候选总数</span><strong>{stats['total']}</strong></div>
         <div class="stat"><span>有行情数据</span><strong>{stats['valid']}</strong></div>
         <div class="stat"><span>平均变动</span><strong class="{pct_class(stats['avg_change'])}">{fmt_pct(stats['avg_change'])}</strong></div>
@@ -413,18 +487,26 @@ def build_stats(rows: list[dict]) -> dict:
 def main() -> None:
     outputs = PROJECT_ROOT / "outputs"
     outputs.mkdir(parents=True, exist_ok=True)
-    candidates = load_candidates()
-    print(f"读取每日候选股票：{len(candidates)} 只")
+    candidates, selected_date = load_candidates()
+    print(f"读取每日候选股票：{len(candidates)} 只（选入日：{selected_date}）")
+
+    # 一次性获取全市场实时行情（含当日数据）
+    print("正在获取全市场实时行情...")
+    spot_df = fetch_spot_all()
+    if spot_df is not None and not spot_df.empty:
+        print(f"实时行情：{len(spot_df)} 只股票")
+    else:
+        print("实时行情获取失败，将回退到逐只日线拉取")
 
     rows: list[dict] = []
     if MAX_WORKERS <= 1:
         for idx, candidate in enumerate(candidates, 1):
-            rows.append(process_one(candidate))
+            rows.append(process_one(candidate, spot_df))
             if idx % 10 == 0:
                 print(f"已复盘 {idx}/{len(candidates)}")
     else:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(process_one, candidate) for candidate in candidates]
+            futures = [executor.submit(process_one, candidate, spot_df) for candidate in candidates]
             for idx, future in enumerate(as_completed(futures), 1):
                 rows.append(future.result())
                 if idx % 10 == 0:
@@ -432,11 +514,21 @@ def main() -> None:
 
     rows = sorted(rows, key=lambda item: item["candidate_score"], reverse=True)
     stats = build_stats(rows)
+    stats["selected_date"] = selected_date
 
     json_path = outputs / "review_yesterday_candidates.json"
     html_path = outputs / "review_yesterday_candidates.html"
     write_json(rows, stats, json_path)
     write_html(rows, stats, html_path)
+
+    # 保存带日期的复盘历史到 history/ 目录
+    history_dir = outputs / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    dated_json = history_dir / f"review_{selected_date}.json"
+    dated_html = history_dir / f"review_{selected_date}.html"
+    shutil.copyfile(json_path, dated_json)
+    shutil.copyfile(html_path, dated_html)
+    print(f"[历史] 已保存 {selected_date} 的复盘记录到 history/ 目录")
 
     print(json.dumps({"stats": stats, "json": str(json_path), "html": str(html_path)}, ensure_ascii=False, indent=2))
 

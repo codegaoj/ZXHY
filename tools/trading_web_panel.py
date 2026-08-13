@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import webbrowser
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -80,6 +80,38 @@ COMMANDS = {
             "tools/review_yesterday_candidates.py",
         ],
     },
+    "periodic_review_weekly": {
+        "name": "按周复盘汇总",
+        "cmd": [
+            sys.executable,
+            "tools/periodic_review.py",
+            "--period",
+            "weekly",
+        ],
+    },
+    "periodic_review_monthly": {
+        "name": "按月复盘汇总",
+        "cmd": [
+            sys.executable,
+            "tools/periodic_review.py",
+            "--period",
+            "monthly",
+        ],
+    },
+    "periodic_review_all": {
+        "name": "全部历史复盘",
+        "cmd": [
+            sys.executable,
+            "tools/periodic_review.py",
+            "--period",
+            "all",
+        ],
+    },
+}
+
+DAILY_WORKFLOW = {
+    "name": "每日一键执行",
+    "steps": ["refresh_spot", "review_candidates", "screen_candidates"],
 }
 
 
@@ -87,6 +119,9 @@ REPORT_LINKS = [
     ("每日候选股票报告", "outputs/daily_candidates.html"),
     ("候选股票复盘报告", "outputs/review_yesterday_candidates.html"),
     ("候选股票复盘 JSON", "outputs/review_yesterday_candidates.json"),
+    ("按周复盘汇总报告", "outputs/periodic_review_weekly.html"),
+    ("按月复盘汇总报告", "outputs/periodic_review_monthly.html"),
+    ("全部历史复盘报告", "outputs/periodic_review_all.html"),
     ("每日候选 CSV 明细", "outputs/daily_candidates.csv"),
     ("每日收盘报告", "outputs/daily_close_report.html"),
     ("完整分析报告", "outputs/complete-analysis-report/complete-analysis-report.html"),
@@ -205,24 +240,136 @@ def _to_float(value, default=0.0) -> float:
         return default
 
 
+# ---- 实时行情缓存（避免每次点击候选股都拉全市场行情）----
+_SPOT_CACHE: dict = {"df": None, "fetched_at": 0.0}
+_SPOT_CACHE_TTL = 300  # 5 分钟缓存
+
+
+def _prefixed_symbol(symbol: str) -> str:
+    if symbol.startswith("6"):
+        return "sh" + symbol
+    if symbol.startswith(("0", "3")):
+        return "sz" + symbol
+    if symbol.startswith(("4", "8", "9")):
+        return "bj" + symbol
+    return symbol
+
+
+def _get_spot_df():
+    """获取全市场实时行情（带 5 分钟缓存）。"""
+    import time as _time
+
+    now = _time.time()
+    if _SPOT_CACHE["df"] is not None and (now - _SPOT_CACHE["fetched_at"]) < _SPOT_CACHE_TTL:
+        return _SPOT_CACHE["df"]
+    try:
+        import akshare as ak
+
+        df = ak.stock_zh_a_spot()
+        _SPOT_CACHE["df"] = df
+        _SPOT_CACHE["fetched_at"] = now
+        return df
+    except Exception:
+        return _SPOT_CACHE["df"]
+
+
+def _supplement_with_spot(df, symbol: str):
+    """如果日线数据不含今天，用实时行情补一行今日数据。"""
+    import pandas as pd
+
+    if df is None or df.empty:
+        return df
+    today_str = date.today().isoformat()
+    last_date = str(df.iloc[-1]["date"]).split(" ")[0]
+    if last_date == today_str:
+        return df  # 已有今天数据
+
+    spot_df = _get_spot_df()
+    if spot_df is None or spot_df.empty or "代码" not in spot_df.columns:
+        return df
+
+    sym_prefixed = _prefixed_symbol(symbol)
+    spot_row = spot_df[spot_df["代码"] == sym_prefixed]
+    if spot_row.empty:
+        spot_row = spot_df[spot_df["代码"] == symbol]
+    if spot_row.empty:
+        return df
+
+    sr = spot_row.iloc[0]
+    today_data = {
+        "date": pd.Timestamp.today().normalize(),
+        "open": _to_float(sr.get("今开")),
+        "close": _to_float(sr.get("最新价")),
+        "high": _to_float(sr.get("最高")),
+        "low": _to_float(sr.get("最低")),
+        "volume": _to_float(sr.get("成交量")),
+    }
+    if today_data["close"] <= 0:
+        return df
+    return pd.concat([df, pd.DataFrame([today_data])], ignore_index=True)
+
+
+def _read_agent_review() -> dict:
+    path = PROJECT_ROOT / "outputs" / "agent_review.json"
+    if not path.exists():
+        return {"ok": False, "reviews": {}, "warnings": [], "recommendations": [], "summary": "", "stats": {}}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        reviews_map = {r["symbol"]: r for r in data.get("reviews", [])}
+        return {
+            "ok": True,
+            "reviews": reviews_map,
+            "warnings": data.get("warnings", []),
+            "recommendations": data.get("recommendations", []),
+            "summary": data.get("summary", ""),
+            "stats": data.get("stats", {}),
+        }
+    except Exception:
+        return {"ok": False, "reviews": {}, "warnings": [], "recommendations": [], "summary": "", "stats": {}}
+
+
 def _read_candidate_rows(limit: int = 40) -> dict:
     path = PROJECT_ROOT / "outputs" / "daily_candidates.csv"
     if not path.exists():
         return {"ok": False, "error": "未找到每日候选股票文件，请先生成每日候选股票。", "items": []}
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
+    agent_review = _read_agent_review()
     items = []
     for row in rows[:limit]:
+        symbol = str(row.get("symbol", "")).strip().zfill(6)
+        review = agent_review["reviews"].get(symbol, {})
         items.append({
-            "symbol": str(row.get("symbol", "")).strip().zfill(6),
+            "symbol": symbol,
             "name": str(row.get("name", "")).strip(),
             "pct_change": _to_float(row.get("pct_change")),
             "close": _to_float(row.get("close")),
             "tags": str(row.get("tags", "")).strip(),
             "score": _to_float(row.get("candidate_score")),
             "reason": str(row.get("candidate_reason", "")).strip(),
+            "chart_quality": int(_to_float(row.get("chart_quality"), 50)),
+            "chart_grade": str(row.get("chart_grade", "")).strip(),
+            "sector": str(row.get("sector", "")).strip(),
+            "sector_strength": str(row.get("sector_strength", "")).strip(),
+            "sector_change": _to_float(row.get("sector_change")),
+            "opinion": review.get("opinion", ""),
+            "issues": review.get("issues", []),
+            "highlights": review.get("highlights", []),
+            "risk_reward": review.get("risk_reward", 0),
+            "risk_level": review.get("risk_level", 0),
+            "position_suggestion": review.get("position_suggestion", ""),
+            "brief": review.get("brief", ""),
         })
-    return {"ok": True, "items": items, "count": len(items)}
+    return {
+        "ok": True,
+        "items": items,
+        "count": len(items),
+        "agent_warnings": agent_review["warnings"],
+        "agent_summary": agent_review["summary"],
+        "agent_recommendations": agent_review["recommendations"],
+        "agent_stats": agent_review["stats"],
+    }
 
 
 def _pick_col(df, names: list[str]) -> str:
@@ -275,6 +422,40 @@ def _safe_ratio_detail(numerator, denominator, default: float = 0.0):
     return (numerator / denominator).fillna(default)
 
 
+def _read_history_list() -> dict:
+    """扫描 outputs/history/ 目录，返回历史记录列表。"""
+    history_dir = PROJECT_ROOT / "outputs" / "history"
+    if not history_dir.exists():
+        return {"ok": True, "candidates": [], "reviews": [], "periodic": [], "total": 0}
+
+    candidates = []
+    reviews = []
+    periodic = []
+
+    for f in sorted(history_dir.iterdir(), reverse=True):
+        if not f.is_file():
+            continue
+        name = f.name
+        size_kb = round(f.stat().st_size / 1024, 1)
+        mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        entry = {"name": name, "size_kb": size_kb, "mtime": mtime, "url": f"/view/outputs/history/{name}"}
+
+        if name.startswith("daily_candidates_"):
+            candidates.append(entry)
+        elif name.startswith("review_"):
+            reviews.append(entry)
+        elif name.startswith("periodic_review_"):
+            periodic.append(entry)
+
+    return {
+        "ok": True,
+        "candidates": candidates,
+        "reviews": reviews,
+        "periodic": periodic,
+        "total": len(candidates) + len(reviews) + len(periodic),
+    }
+
+
 def _read_candidate_detail(symbol: str) -> dict:
     symbol = "".join(ch for ch in str(symbol) if ch.isdigit()).zfill(6)
     if len(symbol) != 6:
@@ -293,6 +474,8 @@ def _read_candidate_detail(symbol: str) -> dict:
     start = end - timedelta(days=180)
     raw = provider.fetch_daily(symbol, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
     df = _normalize_detail_daily(raw)
+    # 用实时行情补全今日数据（东方财富不可用时日线可能缺今天）
+    df = _supplement_with_spot(df, symbol)
     if len(df) < 30:
         return {"ok": False, "error": f"{symbol} 有效日线不足，暂不能绘图。"}
 
@@ -351,6 +534,13 @@ def _read_candidate_detail(symbol: str) -> dict:
         "resistance": round(resistance, 4),
         "latest": latest,
         "records": records,
+        "opinion": item.get("opinion", ""),
+        "issues": item.get("issues", []),
+        "highlights": item.get("highlights", []),
+        "risk_reward": item.get("risk_reward", 0),
+        "risk_level": item.get("risk_level", 0),
+        "position_suggestion": item.get("position_suggestion", ""),
+        "brief": item.get("brief", ""),
     }
 
 
@@ -398,6 +588,66 @@ def _run_action(action: str) -> None:
             "exit_code": code,
         })
         STATE["log"].append("完成。" if code == 0 else f"结束，退出码：{code}")
+
+
+def _run_daily_workflow() -> None:
+    """串行执行每日一键执行流程：刷新行情 → 复盘昨日候选股 → 生成今日候选股票。"""
+    steps = DAILY_WORKFLOW["steps"]
+    total = len(steps)
+    with STATE_LOCK:
+        STATE.update({
+            "running": True,
+            "action": DAILY_WORKFLOW["name"],
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": "",
+            "exit_code": None,
+            "log": [f"开始：{DAILY_WORKFLOW['name']}（共{total}步）"],
+        })
+
+    overall_code = 0
+    for idx, step in enumerate(steps, 1):
+        item = COMMANDS[step]
+        with STATE_LOCK:
+            STATE["action"] = f"{DAILY_WORKFLOW['name']} - 第{idx}/{total}步：{item['name']}"
+            STATE["log"].append(f"--- 第{idx}/{total}步：{item['name']} ---")
+
+        try:
+            proc = subprocess.Popen(
+                item["cmd"],
+                cwd=PROJECT_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                _append_log(line)
+            code = proc.wait()
+        except Exception as exc:
+            code = -1
+            _append_log(f"执行失败：{exc}")
+
+        if code != 0:
+            overall_code = code
+            _append_log(f"第{idx}步「{item['name']}」失败，退出码：{code}，暂停后续步骤。")
+            break
+        else:
+            _append_log(f"第{idx}步「{item['name']}」完成。")
+
+    with STATE_LOCK:
+        STATE.update({
+            "running": False,
+            "action": DAILY_WORKFLOW["name"],
+            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "exit_code": overall_code,
+        })
+        if overall_code == 0:
+            STATE["log"].append("每日一键执行全部完成。")
+        else:
+            STATE["log"].append(f"每日一键执行中断，退出码：{overall_code}")
 
 
 def _safe_project_file(relative_path: str) -> Path | None:
@@ -515,6 +765,24 @@ def _html_page() -> str:
     .chart-wrap {{ width: 100%; overflow: auto; background: #fff; border: 1px solid var(--rule); border-radius: 14px; }}
     .chart-wrap svg {{ display: block; width: 100%; min-width: 760px; height: auto; }}
     .candidate-reason {{ margin-top: 10px; color: var(--muted); font-size: 13px; }}
+    .agent-section {{ }}
+    .agent-summary {{ font-size: 16px; font-weight: 600; color: var(--ink); margin-bottom: 12px; }}
+    .agent-stats {{ display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin-bottom: 14px; }}
+    .agent-stat {{ border: 1px solid var(--rule); background: var(--bg); border-radius: 10px; padding: 8px 10px; text-align: center; }}
+    .agent-stat span {{ display: block; color: var(--muted); font-size: 11px; }}
+    .agent-stat strong {{ display: block; font-size: 18px; margin-top: 2px; }}
+    .agent-warnings {{ background: #fff3e0; border: 1px solid #ff9800; border-radius: 10px; padding: 10px 14px; margin-bottom: 10px; font-size: 13px; }}
+    .agent-warnings ul {{ margin: 6px 0 0; padding-left: 20px; }}
+    .agent-warnings li {{ margin-bottom: 4px; }}
+    .agent-recs {{ background: #e8f5e9; border: 1px solid #4caf50; border-radius: 10px; padding: 10px 14px; margin-bottom: 10px; font-size: 13px; }}
+    .agent-recs ul {{ margin: 6px 0 0; padding-left: 20px; }}
+    .agent-recs li {{ margin-bottom: 4px; }}
+    .agent-review-card {{ border: 1px solid var(--rule); border-radius: 10px; padding: 10px 12px; margin-bottom: 6px; background: #fff; font-size: 13px; }}
+    .agent-review-card .review-header {{ display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }}
+    .agent-review-card .review-brief {{ color: var(--muted); font-size: 12px; }}
+    .risk-badge {{ display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; color: white; }}
+    .highlight-text {{ color: #178a54; font-size: 12px; }}
+    .issue-text {{ color: #b9382f; font-size: 12px; }}
     @media (max-width: 980px) {{ .grid, .reports, .status {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
     @media (max-width: 900px) {{ .candidate-layout {{ grid-template-columns: 1fr; }} }}
     @media (max-width: 620px) {{ main {{ width: calc(100% - 20px); }} .grid, .reports, .status, .chart-meta {{ grid-template-columns: 1fr; }} }}
@@ -558,8 +826,14 @@ def _html_page() -> str:
         <button data-action="backtest"><strong>运行规则回测</strong><span>回测 B1、S1、滴滴、砖形图最近表现</span></button>
         <button data-action="screen_candidates"><strong>生成每日候选股票</strong><span>排除 300/688 后筛选当天可盯盘候选</span></button>
         <button data-action="review_candidates"><strong>复盘昨日候选股票</strong><span>对比候选生成日与最新收盘，检查涨跌表现和破白/破黄风险</span></button>
+        <button data-action="periodic_review_weekly"><strong>按周复盘汇总</strong><span>汇总最近7天选入记录，统计胜率和平均收益</span></button>
+        <button data-action="periodic_review_monthly"><strong>按月复盘汇总</strong><span>汇总最近30天选入记录，统计胜率和平均收益</span></button>
+        <button data-action="periodic_review_all"><strong>全部历史复盘</strong><span>汇总所有历史选入记录，全面评估策略表现</span></button>
       </div>
-      <div class="hint">建议顺序：先填写当天活跃市值，再刷新实时行情，生成每日候选股票；次日收盘后点击“复盘昨日候选股票”，再结合每日收盘报告和回测一起看。</div>
+      <div style="margin-top:14px;">
+        <button class="primary-button" id="runDailyWorkflow" type="button" style="background:#e65100;font-size:16px;padding:12px 24px;"><strong>⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选）</strong></button>
+      </div>
+      <div class="hint">执行顺序：先刷新实时行情，再复盘昨日候选股（用今天行情对比昨天选入价），最后生成今天的候选股。首次使用无历史备份时复盘会跳过，第二天起正常工作。</div>
     </section>
 
     <section>
@@ -567,6 +841,11 @@ def _html_page() -> str:
       <div class="reports">
         {links}
       </div>
+    </section>
+
+    <section>
+      <h2>历史记录 <button id="loadHistory" type="button" class="primary-button" style="font-size:13px;padding:6px 14px;">刷新历史列表</button></h2>
+      <div id="historyList" class="hint">点击"刷新历史列表"查看所有历史候选股和复盘记录。</div>
     </section>
 
     <section>
@@ -604,6 +883,15 @@ def _html_page() -> str:
           <div class="candidate-reason" id="candidateReason"></div>
         </div>
       </div>
+    </section>
+
+    <section class="agent-section">
+      <h2>Agent 审核报告</h2>
+      <div class="agent-summary" id="agentSummary">点击"刷新候选股列表"后自动加载审核结果。</div>
+      <div class="agent-stats" id="agentStats"></div>
+      <div id="agentWarnings"></div>
+      <div id="agentRecs"></div>
+      <div id="agentReviewList"></div>
     </section>
 
     <section>
@@ -690,6 +978,65 @@ def _html_page() -> str:
         document.getElementById('tdxMeta').textContent = '浏览器未允许自动复制，请手动 Ctrl+C 复制。';
       }}
     }}
+    function renderAgentReview(data) {{
+      const summaryEl = document.getElementById('agentSummary');
+      const statsEl = document.getElementById('agentStats');
+      const warningsEl = document.getElementById('agentWarnings');
+      const recsEl = document.getElementById('agentRecs');
+      const listEl = document.getElementById('agentReviewList');
+      // 摘要
+      summaryEl.textContent = data.agent_summary || '暂无审核数据。';
+      // 统计
+      const stats = data.agent_stats || {{}};
+      const opinionCounts = stats.opinion_counts || {{}};
+      const riskDist = stats.risk_level_distribution || {{}};
+      statsEl.innerHTML = '';
+      const statItems = [
+        {{label: '总数', value: stats.total || 0, color: '#355cff'}},
+        {{label: '建议关注', value: opinionCounts['建议关注'] || 0, color: '#4caf50'}},
+        {{label: '谨慎', value: opinionCounts['谨慎'] || 0, color: '#ff9800'}},
+        {{label: '排除', value: opinionCounts['排除'] || 0, color: '#f44336'}},
+        {{label: '平均R/R', value: stats.avg_risk_reward || 0, color: '#355cff'}},
+        {{label: '高风险数', value: stats.high_risk_count || 0, color: '#b71c1c'}},
+      ];
+      statItems.forEach(s => {{
+        const div = document.createElement('div');
+        div.className = 'agent-stat';
+        div.innerHTML = '<span>' + s.label + '</span><strong style="color:' + s.color + ';">' + s.value + '</strong>';
+        statsEl.appendChild(div);
+      }});
+      // 风险提示
+      const warnings = data.agent_warnings || [];
+      if (warnings.length > 0) {{
+        warningsEl.innerHTML = '<div class="agent-warnings"><strong>⚠ 全局风险提示</strong><ul>' +
+          warnings.map(w => '<li>' + w + '</li>').join('') + '</ul></div>';
+      }} else {{
+        warningsEl.innerHTML = '';
+      }}
+      // 操作建议
+      const recs = data.agent_recommendations || [];
+      if (recs.length > 0) {{
+        recsEl.innerHTML = '<div class="agent-recs"><strong>→ 操作建议</strong><ul>' +
+          recs.map(r => '<li>' + r + '</li>').join('') + '</ul></div>';
+      }} else {{
+        recsEl.innerHTML = '';
+      }}
+      // 逐只审核列表
+      const items = data.items || [];
+      const riskColors = {{0: '#4caf50', 1: '#8bc34a', 2: '#ff9800', 3: '#ff5722', 4: '#f44336', 5: '#b71c1c'}};
+      const opinionColors = {{'建议关注': '#4caf50', '谨慎': '#ff9800', '排除': '#f44336'}};
+      const reviewCards = items.filter(it => it.opinion || it.issues.length > 0 || it.highlights.length > 0).map(it => {{
+        const opinionTag = it.opinion ? '<span class="risk-badge" style="background:' + (opinionColors[it.opinion] || '#999') + ';">' + it.opinion + '</span>' : '';
+        const riskTag = it.risk_level > 0 ? '<span class="risk-badge" style="background:' + (riskColors[it.risk_level] || '#999') + ';">风险' + it.risk_level + '</span>' : '';
+        const rrTag = it.risk_reward > 0 ? '<span style="font-size:11px;color:#667085;">R/R=' + it.risk_reward + '</span>' : '';
+        const highlights = it.highlights.length > 0 ? '<div>' + it.highlights.map(h => '<span class="highlight-text">★ ' + h + '</span>').join('<br>') + '</div>' : '';
+        const issues = it.issues.length > 0 ? '<div>' + it.issues.map(i => '<span class="issue-text">- ' + i + '</span>').join('<br>') + '</div>' : '';
+        const posSug = it.position_suggestion ? '<div style="margin-top:4px;color:#355cff;font-size:12px;">仓位：' + it.position_suggestion + '</div>' : '';
+        const brief = it.brief ? '<div class="review-brief">' + it.brief + '</div>' : '';
+        return '<div class="agent-review-card"><div class="review-header"><strong>' + it.symbol + ' ' + it.name + '</strong>' + opinionTag + riskTag + rrTag + '</div>' + brief + highlights + issues + posSug + '</div>';
+      }}).join('');
+      listEl.innerHTML = reviewCards || '<div style="color:#667085;font-size:13px;">暂无逐只审核数据。</div>';
+    }}
     async function loadCandidateList() {{
       const list = document.getElementById('candidateList');
       list.textContent = '读取中...';
@@ -703,13 +1050,32 @@ def _html_page() -> str:
         list.textContent = '暂无候选股，请先生成每日候选股票。';
         return;
       }}
+      // 渲染 Agent 审核报告专区
+      renderAgentReview(data);
       list.innerHTML = '';
+      // Agent 审核警告
+      if (data.agent_warnings && data.agent_warnings.length > 0) {{
+        const warnDiv = document.createElement('div');
+        warnDiv.style.cssText = 'background:#fff3e0;border:1px solid #ff9800;border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:13px;';
+        warnDiv.innerHTML = '<strong>⚠ Agent 风险提示：</strong><br>' + data.agent_warnings.map(w => '· ' + w).join('<br>');
+        list.appendChild(warnDiv);
+      }}
+      const opinionColors = {{'建议关注': '#4caf50', '谨慎': '#ff9800', '排除': '#f44336'}};
+      const riskColors = {{0: '#4caf50', 1: '#8bc34a', 2: '#ff9800', 3: '#ff5722', 4: '#f44336', 5: '#b71c1c'}};
+      const strengthColors = {{'强势': '#4caf50', '中性': '#999', '弱势': '#f44336'}};
       data.items.forEach((item, idx) => {{
         const btn = document.createElement('button');
         btn.className = 'candidate-item';
-        btn.innerHTML = '<strong>' + (idx + 1) + '. ' + item.symbol + ' ' + item.name + '</strong>'
-          + '<span>涨幅 ' + item.pct_change.toFixed(2) + '%｜分数 ' + item.score.toFixed(2) + '</span>'
-          + '<span>' + (item.tags || '无标签') + '</span>';
+        const opinionTag = item.opinion ? '<span style="float:right;font-size:11px;padding:2px 6px;border-radius:3px;color:white;background:' + (opinionColors[item.opinion] || '#999') + ';">' + item.opinion + '</span>' : '';
+        const riskTag = item.risk_level !== undefined && item.risk_level > 0 ? '<span class="risk-badge" style="background:' + (riskColors[item.risk_level] || '#999') + ';">风险' + item.risk_level + '</span>' : '';
+        const gradeTag = item.chart_grade ? '<span style="font-size:11px;color:#666;">图形:' + item.chart_grade + '(' + item.chart_quality + '分)</span>' : '';
+        const sectorTag = item.sector && item.sector !== '未知' ? '<span style="font-size:11px;">板块:<span style="color:' + (strengthColors[item.sector_strength] || '#999') + ';">' + item.sector + (item.sector_change ? '(' + (item.sector_change > 0 ? '+' : '') + item.sector_change.toFixed(2) + '%)' : '') + '</span></span>' : '';
+        const highlightTag = item.highlights && item.highlights.length > 0 ? '<span class="highlight-text">★ ' + item.highlights[0] + '</span>' : '';
+        btn.innerHTML = '<strong>' + (idx + 1) + '. ' + item.symbol + ' ' + item.name + '</strong>' + opinionTag + riskTag
+          + '<span>涨幅 ' + item.pct_change.toFixed(2) + '%｜分数 ' + item.score.toFixed(2) + (item.risk_reward > 0 ? '｜R/R=' + item.risk_reward : '') + '</span>'
+          + '<span>' + (item.tags || '无标签') + '</span>'
+          + (gradeTag || sectorTag ? '<span>' + gradeTag + (gradeTag && sectorTag ? '｜' : '') + sectorTag + '</span>' : '')
+          + (highlightTag ? highlightTag : '');
         btn.addEventListener('click', () => loadCandidateDetail(item.symbol, btn));
         list.appendChild(btn);
       }});
@@ -734,6 +1100,30 @@ def _html_page() -> str:
       document.getElementById('detailRange').textContent = data.support + ' / ' + data.resistance;
       document.getElementById('candidateReason').textContent = '标签：' + (data.tags || '无') + '。原因：' + (data.candidate_reason || '无');
       document.getElementById('candidateChart').innerHTML = drawCandidateChart(data);
+      // Agent 审核详情
+      const riskColors = {{0: '#4caf50', 1: '#8bc34a', 2: '#ff9800', 3: '#ff5722', 4: '#f44336', 5: '#b71c1c'}};
+      const opinionColors = {{'建议关注': '#4caf50', '谨慎': '#ff9800', '排除': '#f44336'}};
+      let reviewHtml = '';
+      if (data.opinion || data.brief) {{
+        const opinionTag = data.opinion ? '<span class="risk-badge" style="background:' + (opinionColors[data.opinion] || '#999') + ';">' + data.opinion + '</span>' : '';
+        const riskTag = data.risk_level > 0 ? '<span class="risk-badge" style="background:' + (riskColors[data.risk_level] || '#999') + ';">风险' + data.risk_level + '</span>' : '';
+        const rrTag = data.risk_reward > 0 ? '<span style="font-size:12px;color:#667085;">R/R=' + data.risk_reward + '</span>' : '';
+        reviewHtml += '<div style="margin-top:10px;padding:10px 12px;border:1px solid #d9deea;border-radius:10px;background:#fff;font-size:13px;">';
+        reviewHtml += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;"><strong>Agent 审核</strong>' + opinionTag + riskTag + rrTag + '</div>';
+        if (data.brief) reviewHtml += '<div class="review-brief">' + data.brief + '</div>';
+        if (data.highlights && data.highlights.length > 0) {{
+          reviewHtml += '<div style="margin-top:6px;">' + data.highlights.map(h => '<span class="highlight-text">★ ' + h + '</span>').join('<br>') + '</div>';
+        }}
+        if (data.issues && data.issues.length > 0) {{
+          reviewHtml += '<div style="margin-top:6px;">' + data.issues.map(i => '<span class="issue-text">- ' + i + '</span>').join('<br>') + '</div>';
+        }}
+        if (data.position_suggestion) {{
+          reviewHtml += '<div style="margin-top:6px;color:#355cff;">仓位建议：' + data.position_suggestion + '</div>';
+        }}
+        reviewHtml += '</div>';
+      }}
+      const reasonEl = document.getElementById('candidateReason');
+      reasonEl.innerHTML = '标签：' + (data.tags || '无') + '。原因：' + (data.candidate_reason || '无') + reviewHtml;
     }}
     function drawCandidateChart(data) {{
       const records = data.records || [];
@@ -845,6 +1235,75 @@ def _html_page() -> str:
     showTdxAllButton.addEventListener('click', () => showTdxCodes(null));
     copyTdxCodesButton.addEventListener('click', copyTdxCodes);
     loadCandidatesButton.addEventListener('click', loadCandidateList);
+    // 历史记录加载
+    const loadHistoryButton = document.getElementById('loadHistory');
+    loadHistoryButton.addEventListener('click', async () => {{
+      const el = document.getElementById('historyList');
+      el.textContent = '加载中...';
+      try {{
+        const res = await fetch('/history-list');
+        const data = await res.json();
+        if (!data.ok || data.total === 0) {{
+          el.innerHTML = '<div class="hint">暂无历史记录。每次生成候选股或复盘后会自动保存到这里。</div>';
+          return;
+        }}
+        let html = '';
+        if (data.candidates.length > 0) {{
+          html += '<h3 style="font-size:14px;margin:8px 0 4px;">候选股记录（' + data.candidates.length + '）</h3>';
+          html += '<table style="width:100%;font-size:13px;border-collapse:collapse;"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d9deea;">文件名</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid #d9deea;">大小</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid #d9deea;">时间</th></tr></thead><tbody>';
+          data.candidates.forEach(f => {{
+            html += '<tr><td style="padding:4px 8px;"><a href="' + f.url + '" target="_blank">' + f.name + '</a></td><td style="text-align:right;padding:4px 8px;color:#667085;">' + f.size_kb + 'KB</td><td style="text-align:right;padding:4px 8px;color:#667085;">' + f.mtime + '</td></tr>';
+          }});
+          html += '</tbody></table>';
+        }}
+        if (data.reviews.length > 0) {{
+          html += '<h3 style="font-size:14px;margin:12px 0 4px;">复盘记录（' + data.reviews.length + '）</h3>';
+          html += '<table style="width:100%;font-size:13px;border-collapse:collapse;"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d9deea;">文件名</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid #d9deea;">大小</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid #d9deea;">时间</th></tr></thead><tbody>';
+          data.reviews.forEach(f => {{
+            html += '<tr><td style="padding:4px 8px;"><a href="' + f.url + '" target="_blank">' + f.name + '</a></td><td style="text-align:right;padding:4px 8px;color:#667085;">' + f.size_kb + 'KB</td><td style="text-align:right;padding:4px 8px;color:#667085;">' + f.mtime + '</td></tr>';
+          }});
+          html += '</tbody></table>';
+        }}
+        if (data.periodic.length > 0) {{
+          html += '<h3 style="font-size:14px;margin:12px 0 4px;">周期汇总报告（' + data.periodic.length + '）</h3>';
+          html += '<table style="width:100%;font-size:13px;border-collapse:collapse;"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d9deea;">文件名</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid #d9deea;">大小</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid #d9deea;">时间</th></tr></thead><tbody>';
+          data.periodic.forEach(f => {{
+            html += '<tr><td style="padding:4px 8px;"><a href="' + f.url + '" target="_blank">' + f.name + '</a></td><td style="text-align:right;padding:4px 8px;color:#667085;">' + f.size_kb + 'KB</td><td style="text-align:right;padding:4px 8px;color:#667085;">' + f.mtime + '</td></tr>';
+          }});
+          html += '</tbody></table>';
+        }}
+        el.innerHTML = html;
+      }} catch(e) {{
+        el.textContent = '加载失败：' + e.message;
+      }}
+    }});
+    function appendLog(msg) {{
+      const logEl = document.getElementById('log');
+      logEl.textContent += '\\n' + msg;
+    }}
+    const runDailyWorkflowButton = document.getElementById('runDailyWorkflow');
+    runDailyWorkflowButton.addEventListener('click', async () => {{
+        if (!confirm('将依次执行：刷新行情缓存→复盘昨日候选股→生成今日候选股票。约需3-5分钟，确认开始？')) return;
+        runDailyWorkflowButton.disabled = true;
+        runDailyWorkflowButton.textContent = '执行中...';
+        try {{
+            const res = await fetch('/run', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{action: 'daily_workflow'}})
+            }});
+            const data = await res.json();
+            appendLog(`每日一键执行已触发：${{data.message || 'ok'}}`);
+            refreshStatus();
+        }} catch(e) {{
+            appendLog('每日一键执行请求失败：' + e.message);
+        }} finally {{
+            setTimeout(() => {{
+                runDailyWorkflowButton.disabled = false;
+                runDailyWorkflowButton.textContent = '⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选）';
+            }}, 5000);
+        }}
+    }});
     refreshActiveMarketValue();
     loadCandidateList();
     refreshStatus();
@@ -884,6 +1343,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/candidate-list"):
             self._send_json(_read_candidate_rows())
+            return
+        if self.path.startswith("/history-list"):
+            self._send_json(_read_history_list())
             return
         if self.path.startswith("/candidate-detail"):
             parsed = urlparse(self.path)
@@ -929,6 +1391,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "未知接口"}, 404)
             return
         action = payload.get("action")
+        if action == "daily_workflow":
+            with STATE_LOCK:
+                if STATE["running"]:
+                    self._send_json({"ok": False, "error": "已有任务正在运行，请等待完成"}, 409)
+                    return
+            threading.Thread(target=_run_daily_workflow, daemon=True).start()
+            self._send_json({"ok": True, "message": "每日一键执行已启动"})
+            return
         if action not in COMMANDS:
             self._send_json({"ok": False, "error": "未知操作"}, 400)
             return

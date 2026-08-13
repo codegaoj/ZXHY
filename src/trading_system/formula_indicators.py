@@ -47,6 +47,24 @@ def _bars_since_previous_true(series: pd.Series) -> int | None:
     return int(series.index[-1] - last_hit)
 
 
+def _resolve_open(df: pd.DataFrame, close: pd.Series) -> pd.Series:
+    """获取开盘价：优先 open / 开盘 / 开盘价；缺失时用前收盘价近似，避免缺字段报错。"""
+    for col in ("open", "开盘", "开盘价"):
+        if col in df.columns:
+            return df[col].astype(float)
+    return close.shift(1).fillna(close)
+
+
+def _last_float(series: pd.Series, default: float = -1.0) -> float:
+    """安全取序列末值用于调试：空序列或 NaN 时返回 default。"""
+    if len(series) == 0:
+        return default
+    value = series.iloc[-1]
+    if value is None or pd.isna(value):
+        return default
+    return round(float(value), 4)
+
+
 def evaluate_formulas(df: pd.DataFrame) -> FormulaEvaluation:
     close = df["close"].astype(float)
     high = df["high"].astype(float)
@@ -123,6 +141,69 @@ def evaluate_formulas(df: pd.DataFrame) -> FormulaEvaluation:
     signals["知行趋势达标"] = bool(trend_ok.iloc[-1])
     signals["BBI_MA60多头"] = bool(close.iloc[-1] > bbi.iloc[-1] and close.iloc[-1] > ma60.iloc[-1])
 
+    # ---- 实战信号标签（牛市增强）----
+    open_price = _resolve_open(df, close)
+
+    # 公共量能变量
+    vol_avg_5 = volume.rolling(5, min_periods=1).mean().shift(1)  # 前5日平均成交量（昨日视角）
+    vol_ratio_to_prev = volume / volume.shift(1)  # 今日量 / 昨日量
+    # 过去5日（截至昨日）成交量萎缩（< 前一日*0.9）的天数
+    vol_shrink_count = (vol_ratio_to_prev < 0.9).rolling(5, min_periods=1).sum().shift(1)
+
+    # 1. 滴滴战法：缩量回调后放量反弹
+    didi = (
+        (vol_shrink_count >= 3)  # 过去5日至少3天缩量
+        & (volume > vol_avg_5 * 1.2)  # 今日放量
+        & (pct_change > 0)  # 今日上涨
+        & trend_ok  # 知行趋势达标
+    )
+
+    # 2. 关键K线-放量长阳
+    body_pct = _safe_ratio(close - open_price, open_price) * 100  # 实体涨幅(%)
+    upper_shadow_ratio = _safe_ratio(high - close, high - low)  # 上影线占比
+    key_long_yang = (
+        (body_pct > 3)  # 实体涨幅 > 3%
+        & (volume > vol_avg_5 * 1.5)  # 量比前5日均量放大1.5倍
+        & (upper_shadow_ratio < 0.3)  # 上影线短
+    )
+
+    # 3. 关键K线-锤头线
+    body_len = (close - open_price).abs()
+    candle_min = pd.concat([open_price, close], axis=1).min(axis=1)
+    candle_max = pd.concat([open_price, close], axis=1).max(axis=1)
+    lower_shadow = candle_min - low
+    upper_shadow = high - candle_max
+    low_5_min = low.rolling(5, min_periods=1).min()
+    key_hammer = (
+        (lower_shadow > body_len * 2)  # 下影线 > 实体2倍
+        & (upper_shadow < body_len * 0.5)  # 上影线 < 实体0.5倍
+        & (low <= low_5_min)  # 今日最低创近5日新低
+    )
+
+    # 4. 回踩白线反弹
+    near_white_prev = _safe_ratio((low.shift(1) - zxdq.shift(1)).abs(), zxdq.shift(1)) < 0.02
+    near_white_prev2 = _safe_ratio((low.shift(2) - zxdq.shift(2)).abs(), zxdq.shift(2)) < 0.02
+    pullback_white = (
+        (near_white_prev | near_white_prev2)  # 昨日或前日低点回踩白线
+        & (close > zxdq)  # 今日站上白线
+        & (pct_change > 0)  # 今日上涨
+        & trend_ok  # 知行趋势达标
+    )
+
+    # 5. 突破压力位（近20日最高价作为压力位）
+    resistance_20 = high.rolling(20, min_periods=1).max().shift(1)  # 昨日视角的20日最高
+    breakout_resistance = (
+        (close.shift(1) < resistance_20)  # 昨日收盘 < 压力位
+        & (close > resistance_20)  # 今日收盘 > 压力位
+        & (volume > vol_avg_5 * 1.2)  # 今日放量
+    )
+
+    signals["滴滴战法"] = bool(didi.iloc[-1])
+    signals["放量长阳"] = bool(key_long_yang.iloc[-1])
+    signals["锤头线"] = bool(key_hammer.iloc[-1])
+    signals["回踩白线"] = bool(pullback_white.iloc[-1])
+    signals["突破压力"] = bool(breakout_resistance.iloc[-1])
+
     if signals["B1买点"] or signals["B2买点"]:
         tags.append("B1/B2买点")
     if signals["单针下20"]:
@@ -133,6 +214,17 @@ def evaluate_formulas(df: pd.DataFrame) -> FormulaEvaluation:
         tags.append("双线/白黄线")
     if signals["BBI_MA60多头"]:
         tags.append("BBI/MA60")
+
+    if signals["滴滴战法"]:
+        tags.append("滴滴战法")
+    if signals["放量长阳"]:
+        tags.append("放量长阳")
+    if signals["锤头线"]:
+        tags.append("锤头线")
+    if signals["回踩白线"]:
+        tags.append("回踩白线")
+    if signals["突破压力"]:
+        tags.append("突破压力")
 
     values.update({
         "j": round(float(j.iloc[-1]), 4),
@@ -146,6 +238,13 @@ def evaluate_formulas(df: pd.DataFrame) -> FormulaEvaluation:
         "single_long": round(float(long.iloc[-1]), 4),
         "brick": round(float(brick.iloc[-1]), 4),
         "b1_days": float(b1_days) if b1_days is not None else -1.0,
+        "vol_avg_5": _last_float(vol_avg_5),
+        "vol_shrink_count": _last_float(vol_shrink_count),
+        "body_pct": _last_float(body_pct),
+        "upper_shadow_ratio": _last_float(upper_shadow_ratio),
+        "lower_shadow": _last_float(lower_shadow),
+        "upper_shadow": _last_float(upper_shadow),
+        "resistance_20": _last_float(resistance_20),
     })
 
     return FormulaEvaluation(tags=tags, signals=signals, values=values)
