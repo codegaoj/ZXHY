@@ -231,24 +231,48 @@ def save_config() -> Path:
     return path
 
 
-def prefilter_for_history(pool: pd.DataFrame) -> pd.DataFrame:
+def prefilter_for_history(pool: pd.DataFrame, market_regime: str = "neutral_strong") -> pd.DataFrame:
     df = pool.copy()
     if df["amount"].fillna(0).sum() <= 0:
-        # 实时行情不可用时，只能用代码池先做历史日线计算；为控制耗时，优先处理沪深主板和北交所前若干只。
         df["prefilter_score"] = 1.0
         preferred = df[df["symbol"].str.startswith(("000", "001", "002", "003", "600", "601", "603", "605"))].copy()
         if preferred.empty:
             preferred = df.copy()
         return preferred.head(PREFILTER_LIMIT).reset_index(drop=True)
-    # 多头区间下，先筛掉流动性过弱、涨跌停附近、当日明显走弱的票。
-    df = df[
-        (df["amount"] >= 50_000_000)
-        & (df["pct_change"] > 0)
-        & (df["pct_change"] < 8.8)
-        & (df["close"] >= df["open"])
-        & (df["high"] > 0)
-        & (df["close"] >= df["low"] * 1.01)
-    ].copy()
+
+    is_weak = market_regime in ("neutral_weak", "bear")
+    is_balanced = market_regime == "neutral_balanced"
+
+    if is_weak:
+        # 震荡偏弱/空头：选"逆势抗跌"股，不追当日上涨股
+        df = df[
+            (df["amount"] >= 50_000_000)
+            & (df["pct_change"] > -3.0)
+            & (df["pct_change"] < 5.0)
+            & (df["high"] > 0)
+            & (df["close"] >= df["low"] * 1.005)
+        ].copy()
+    elif is_balanced:
+        # 震荡中性：放宽涨跌幅要求，包含平盘和小涨
+        df = df[
+            (df["amount"] >= 50_000_000)
+            & (df["pct_change"] > -1.0)
+            & (df["pct_change"] < 7.0)
+            & (df["close"] >= df["open"] * 0.99)
+            & (df["high"] > 0)
+            & (df["close"] >= df["low"] * 1.005)
+        ].copy()
+    else:
+        # 震荡偏强/多头：选当日上涨股
+        df = df[
+            (df["amount"] >= 50_000_000)
+            & (df["pct_change"] > 0)
+            & (df["pct_change"] < 8.8)
+            & (df["close"] >= df["open"])
+            & (df["high"] > 0)
+            & (df["close"] >= df["low"] * 1.01)
+        ].copy()
+
     if df.empty:
         return df
     amount_rank = df["amount"].rank(pct=True)
@@ -326,7 +350,7 @@ def signal_text(plan) -> str:
     return "；".join(f"{sig.signal_type}:{sig.reason}" for sig in plan.entry_signals)
 
 
-def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50) -> tuple[float, str]:
+def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50, market_regime: str = "neutral_strong") -> tuple[float, str]:
     close_above_lines = snapshot.close >= snapshot.white_line and snapshot.close >= snapshot.yellow_line
     macd_ok = is_macd_bullish(snapshot)
     no_risk = len(plan.risk_actions) == 0
@@ -334,6 +358,9 @@ def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50) -> 
     tag_set = set(snapshot.tags)
     reasons = []
     score = 0.0
+
+    is_weak = market_regime in ("neutral_weak", "bear")
+    is_balanced = market_regime == "neutral_balanced"
 
     severe_risk = any(("清仓" in r.action or "退出" in r.action or "否决" in r.action) for r in plan.risk_actions)
     reduce_risk = any("减仓" in r.action for r in plan.risk_actions)
@@ -368,7 +395,7 @@ def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50) -> 
     if "双线/白黄线" in tag_set:
         score += 8
         reasons.append("知行趋势达标")
-    # ---- 新增实战信号评分 ----
+    # ---- 实战信号评分 ----
     if "滴滴战法" in tag_set:
         score += 15
         reasons.append("滴滴战法（缩量后放量反弹）")
@@ -388,12 +415,40 @@ def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50) -> 
         score += min(10, (volume_ratio - 1.0) * 8)
         reasons.append(f"量能放大 {volume_ratio:.2f}x")
     pct = float(spot_row["pct_change"])
-    if 1.0 <= pct <= 5.5:
-        score += 8
-        reasons.append("涨幅温和偏强")
-    elif 0 < pct < 1.0:
-        score += 4
-        reasons.append("小阳线")
+
+    if is_weak:
+        # 震荡偏弱：逆势抗跌股加分，追涨股减分
+        if -2.0 <= pct <= 0.5:
+            score += 10
+            reasons.append("逆势抗跌（跌幅可控）")
+        elif 1.0 <= pct <= 5.5:
+            score += 3
+            reasons.append("涨幅温和")
+        elif pct > 5.5:
+            score -= 5
+            reasons.append("涨幅过大，追高风险")
+        # 非B1标签在弱市轻度降权
+        if "B1/B2买点" not in tag_set:
+            score -= 5
+            reasons.append("非B1信号在弱市轻度降权")
+    elif is_balanced:
+        if 1.0 <= pct <= 5.5:
+            score += 6
+            reasons.append("涨幅温和偏强")
+        elif 0 < pct < 1.0:
+            score += 4
+            reasons.append("小阳线")
+        elif -1.0 <= pct <= 0:
+            score += 3
+            reasons.append("平盘抗跌")
+    else:
+        if 1.0 <= pct <= 5.5:
+            score += 8
+            reasons.append("涨幅温和偏强")
+        elif 0 < pct < 1.0:
+            score += 4
+            reasons.append("小阳线")
+
     if snapshot.close < snapshot.resistance_price:
         distance_to_resistance = (snapshot.resistance_price / snapshot.close - 1) * 100
         if distance_to_resistance >= 2:
@@ -411,10 +466,14 @@ def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50) -> 
         score -= 5
         reasons.append(f"图形质量较差({chart_quality_score}分)")
 
+    # ---- 弱市标记低分 ----
+    if is_weak and score < 30:
+        reasons.append("弱市综合分数偏低")
+
     return round(score, 2), "；".join(reasons)
 
 
-def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: str, active_market_value_pct: float, recent_values: list[float] = None, sector_mapping: dict[str, str] = None, sector_performance: dict[str, dict] = None) -> dict | None:
+def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: str, active_market_value_pct: float, recent_values: list[float] = None, sector_mapping: dict[str, str] = None, sector_performance: dict[str, dict] = None, market_regime: str = "neutral_strong", market_override: str = None) -> dict | None:
     symbol = row["symbol"]
     name = row["name"]
     try:
@@ -422,20 +481,20 @@ def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: s
         if daily is None or daily.empty or len(daily) < 60:
             return None
         snapshot = build_snapshot(WatchSymbol(symbol=symbol, name=name, tags=[]), daily, active_market_value_pct, recent_values)
-        plan = engine.build_plan(snapshot)
-        # 计算图形质量评分
+        plan = engine.build_plan(snapshot, market_override=market_override)
         cq = evaluate_chart_quality(daily)
         if float(row.get("amount", 0) or 0) <= 0:
             row["pct_change"] = snapshot.pct_change
             row["amount"] = 0.0
-        candidate_score, candidate_reason = score_candidate(snapshot, plan, row, cq.score)
+        candidate_score, candidate_reason = score_candidate(snapshot, plan, row, cq.score, market_regime=market_regime)
         # ---- 板块强度加分 ----
         sector_info = get_sector_info(symbol, sector_mapping or {}, sector_performance or {})
         sector_bonus = sector_strength_score(sector_info)
         candidate_score += sector_bonus
         if sector_info:
             candidate_reason += f"；板块{sector_info.strength}({sector_info.sector_name}+{sector_info.sector_change}%)"
-        if candidate_score < 25:
+        min_threshold = 30 if market_regime in ("neutral_weak", "bear") else 25
+        if candidate_score < min_threshold:
             return None
         return {
             "symbol": symbol,
@@ -479,7 +538,7 @@ def write_csv(rows: list[dict], path: Path) -> None:
         writer.writerows(rows)
 
 
-def write_html(rows: list[dict], stats: dict, path: Path, active_market_value_pct: float) -> None:
+def write_html(rows: list[dict], stats: dict, path: Path, active_market_value_pct: float, market_regime: str = "", market_reason: str = "") -> None:
     def fmt_amount(v):
         return f"{float(v) / 100000000:.2f} 亿"
 
@@ -553,8 +612,9 @@ def write_html(rows: list[dict], stats: dict, path: Path, active_market_value_pc
         <div class="card"><span>历史计算数</span><strong>{stats['prefilter_count']}</strong></div>
         <div class="card"><span>候选数</span><strong>{len(rows)}</strong></div>
         <div class="card"><span>活跃市值</span><strong>{active_market_value_pct}%</strong></div>
-        <div class="card"><span>行业板块数</span><strong>{stats.get('sector_count', 0)}</strong></div>
+        <div class="card"><span>市场状态</span><strong style="font-size:18px">{html.escape(market_regime)}</strong></div>
       </div>
+      <div class="note" style="margin-top:12px">{html.escape(market_reason)}</div>
     </header>
     <section>
       <h2>筛选口径</h2>
@@ -581,27 +641,44 @@ def write_html(rows: list[dict], stats: dict, path: Path, active_market_value_pc
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="每日候选股票筛选")
+    parser.add_argument("--market-override", type=str, default=None,
+                        choices=["bull", "neutral_strong", "neutral_balanced", "neutral_weak", "bear"],
+                        help="手动覆盖市场状态（自动评估时留空）")
+    args = parser.parse_args()
+
     outputs = PROJECT_ROOT / "outputs"
     outputs.mkdir(parents=True, exist_ok=True)
 
     active_market_value_pct = load_active_market_value_pct()
     recent_values = load_recent_active_market_values(days=3)
 
+    rulebook = Rulebook.load(PROJECT_ROOT / "config" / "rulebook.json")
+    engine = TradePlanEngine(rulebook)
+
+    # 评估市场状态（自动或手动覆盖）
+    market_state = engine.market_engine.evaluate(
+        active_market_value_pct,
+        recent_values[-1] if recent_values else 0.0,
+        recent_values,
+        manual_override=args.market_override,
+    )
+    market_regime = market_state.regime.policy_key
+    print(f"[市场状态] {market_state.regime.value} | 活跃市值 {active_market_value_pct:.2f}% | 仓位上限 {market_state.max_position_pct}% | {'手动覆盖' if market_state.manual_override else '自动评估'}")
+    print(f"[市场状态] {market_state.reason}")
+
     spot = load_spot()
     pool = filter_pool(spot)
     watchlist_path = save_watchlist(pool)
     config_path = save_config()
-    pre = prefilter_for_history(pool)
+    pre = prefilter_for_history(pool, market_regime=market_regime)
 
     end = date.today()
     start = end - timedelta(days=HISTORY_DAYS + 30)
     start_date = start.strftime("%Y%m%d")
     end_date = end.strftime("%Y%m%d")
 
-    rulebook = Rulebook.load(PROJECT_ROOT / "config" / "rulebook.json")
-    engine = TradePlanEngine(rulebook)
-
-    # 板块分析（将预筛选股票代码传入，用CNINFO补充未覆盖的股票）
     print("正在加载板块数据...")
     supplement_symbols = [str(r.get("symbol", "")).strip().zfill(6) for r in pre.to_dict("records")]
     sector_mapping = build_sector_mapping(PROJECT_ROOT / "data" / "sector_mapping.csv", supplement_symbols=supplement_symbols)
@@ -611,7 +688,7 @@ def main():
     rows = []
     records = pre.to_dict("records")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(process_one, row, engine, start_date, end_date, active_market_value_pct, recent_values, sector_mapping, sector_performance) for row in records]
+        futures = [executor.submit(process_one, row, engine, start_date, end_date, active_market_value_pct, recent_values, sector_mapping, sector_performance, market_regime, args.market_override) for row in records]
         for idx, future in enumerate(as_completed(futures), 1):
             result = future.result()
             if result:
@@ -627,15 +704,18 @@ def main():
         "sector_count": int(len(sector_performance)),
         "watchlist_path": str(watchlist_path),
         "config_path": str(config_path),
+        "market_regime": market_state.regime.value,
+        "market_reason": market_state.reason,
+        "manual_override": market_state.manual_override,
     }
 
     daily_csv = outputs / "daily_candidates.csv"
     daily_html = outputs / "daily_candidates.html"
     daily_json = outputs / "daily_candidates.json"
     write_csv(rows, daily_csv)
-    write_html(rows, stats, daily_html, active_market_value_pct)
+    write_html(rows, stats, daily_html, active_market_value_pct, market_regime=market_state.regime.value, market_reason=market_state.reason)
     today_str = date.today().isoformat()
-    daily_json.write_text(json.dumps({"date": today_str, "stats": stats, "candidates": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+    daily_json.write_text(json.dumps({"date": today_str, "market_regime": market_state.regime.value, "market_reason": market_state.reason, "manual_override": market_state.manual_override, "stats": stats, "candidates": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 保存带日期的历史备份到 history/ 目录（CSV + JSON + HTML）
     history_dir = outputs / "history"

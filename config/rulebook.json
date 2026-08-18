@@ -4,12 +4,17 @@
     "bear_threshold": -2.3,
     "macd_zero_axis_required_for_aggressive": true,
     "cumulative_days": 3,
-    "cumulative_threshold": 4.0
+    "cumulative_threshold": 4.0,
+    "neutral_strong_threshold": 1.0,
+    "neutral_weak_threshold": -0.5
   },
   "position_policy": {
-    "bull": {"max_position_pct": 80, "single_symbol_pct": 20},
-    "neutral": {"max_position_pct": 50, "single_symbol_pct": 12},
-    "bear": {"max_position_pct": 10, "single_symbol_pct": 3}
+    "bull": {"max_position_pct": 80, "single_symbol_pct": 20, "allow_b2": true},
+    "neutral_strong": {"max_position_pct": 50, "single_symbol_pct": 12, "allow_b2": true},
+    "neutral_balanced": {"max_position_pct": 35, "single_symbol_pct": 8, "allow_b2": false},
+    "neutral_weak": {"max_position_pct": 20, "single_symbol_pct": 5, "allow_b2": false},
+    "neutral": {"max_position_pct": 50, "single_symbol_pct": 12, "allow_b2": true},
+    "bear": {"max_position_pct": 10, "single_symbol_pct": 3, "allow_b2": false}
   },
   "risk_priority": [
     "盈转亏",

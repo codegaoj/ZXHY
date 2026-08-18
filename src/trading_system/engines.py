@@ -24,16 +24,20 @@ class MarketTimingEngine:
         active_market_value_pct: float,
         macd_dif: float = 0.0,
         recent_values: Optional[List[float]] = None,
+        manual_override: Optional[str] = None,
     ) -> MarketState:
         cfg = self.rulebook.market_timing
         bull = float(cfg["bull_threshold"])
         bear = float(cfg["bear_threshold"])
         macd_above_zero = macd_dif > 0
 
+        if manual_override:
+            return self._apply_override(manual_override, active_market_value_pct, macd_above_zero, recent_values, cfg)
+
         # 单日多头判定
         single_day_bull = active_market_value_pct >= bull
 
-        # 3日累计多头判定：近 N 根 K 线累计涨幅 >= 阈值
+        # 3日累计多头判定
         cumulative_bull = False
         cumulative_detail = ""
         cum_days = int(cfg.get("cumulative_days", 3))
@@ -53,23 +57,14 @@ class MarketTimingEngine:
                 reason = f"活跃市值单日 {active_market_value_pct:.2f}% >= {bull:.1f}%，且 MACD 在零轴上方，允许进攻。"
             else:
                 reason = f"{cumulative_detail}，且 MACD 在零轴上方，允许进攻。"
-            policy_key = "bull"
         elif active_market_value_pct <= bear:
             regime = MarketRegime.BEAR
             reason = f"活跃市值单日 {active_market_value_pct:.2f}% <= {bear:.1f}%，进入空头阈值，原则上只卖不买。"
-            policy_key = "bear"
         else:
-            regime = MarketRegime.NEUTRAL
-            parts = [f"活跃市值单日 {active_market_value_pct:.2f}%"]
-            if recent_values and len(recent_values) >= 1:
-                recent_slice = recent_values[-cum_days:]
-                cum_sum = round(sum(recent_slice), 4)
-                parts.append(f"近{len(recent_slice)}日累计 {cum_sum:.2f}%")
-            parts.append("未达多头或空头阈值，按震荡处理，降低仓位。")
-            reason = "，".join(parts)
-            policy_key = "neutral"
+            regime = self._classify_neutral(active_market_value_pct, cfg)
+            reason = self._neutral_reason(regime, active_market_value_pct, recent_values, cfg)
 
-        policy = self.rulebook.position_policy[policy_key]
+        policy = self.rulebook.position_policy[regime.policy_key]
         return MarketState(
             regime=regime,
             active_market_value_pct=active_market_value_pct,
@@ -77,7 +72,55 @@ class MarketTimingEngine:
             reason=reason,
             max_position_pct=int(policy["max_position_pct"]),
             single_symbol_pct=int(policy["single_symbol_pct"]),
+            manual_override=False,
         )
+
+    def _apply_override(self, override: str, amv: float, macd_above: bool, recent_values, cfg) -> MarketState:
+        override_map = {
+            "bull": MarketRegime.BULL,
+            "neutral_strong": MarketRegime.NEUTRAL_STRONG,
+            "neutral_balanced": MarketRegime.NEUTRAL_BALANCED,
+            "neutral_weak": MarketRegime.NEUTRAL_WEAK,
+            "bear": MarketRegime.BEAR,
+        }
+        regime = override_map.get(override, MarketRegime.NEUTRAL_BALANCED)
+        policy = self.rulebook.position_policy[regime.policy_key]
+        reason = f"[手动覆盖] 当前市场状态设为：{regime.value}（活跃市值 {amv:.2f}%）。"
+        return MarketState(
+            regime=regime,
+            active_market_value_pct=amv,
+            macd_above_zero=macd_above,
+            reason=reason,
+            max_position_pct=int(policy["max_position_pct"]),
+            single_symbol_pct=int(policy["single_symbol_pct"]),
+            manual_override=True,
+        )
+
+    @staticmethod
+    def _classify_neutral(amv: float, cfg: dict) -> MarketRegime:
+        strong_threshold = float(cfg.get("neutral_strong_threshold", 1.0))
+        weak_threshold = float(cfg.get("neutral_weak_threshold", -0.5))
+        if amv >= strong_threshold:
+            return MarketRegime.NEUTRAL_STRONG
+        if amv <= weak_threshold:
+            return MarketRegime.NEUTRAL_WEAK
+        return MarketRegime.NEUTRAL_BALANCED
+
+    @staticmethod
+    def _neutral_reason(regime: MarketRegime, amv: float, recent_values, cfg: dict) -> str:
+        parts = [f"活跃市值单日 {amv:.2f}%"]
+        cum_days = int(cfg.get("cumulative_days", 3))
+        if recent_values and len(recent_values) >= 1:
+            recent_slice = recent_values[-cum_days:]
+            cum_sum = round(sum(recent_slice), 4)
+            parts.append(f"近{len(recent_slice)}日累计 {cum_sum:.2f}%")
+        if regime == MarketRegime.NEUTRAL_STRONG:
+            parts.append("震荡偏强，可半仓操作B1，B2谨慎参与。")
+        elif regime == MarketRegime.NEUTRAL_WEAK:
+            parts.append("震荡偏弱，仓位压至20%以下，仅做B1，蹬起来就卖。")
+        else:
+            parts.append("震荡中性，仓位30%-35%，仅做完美B1，少动=赢。")
+        return "，".join(parts)
 
 
 class EntrySignalEngine:
@@ -125,6 +168,10 @@ class EntrySignalEngine:
             for signal in signals:
                 signal.score = max(0, signal.score - 25)
                 signal.reason += " 但市场处于空头区间，进攻分数下调。"
+        elif market.regime == MarketRegime.NEUTRAL_WEAK:
+            for signal in signals:
+                signal.score = max(0, signal.score - 12)
+                signal.reason += " 震荡偏弱区间，进攻分数适度下调。"
 
         return signals
 
@@ -197,11 +244,12 @@ class TradePlanEngine:
         self.entry_engine = EntrySignalEngine(rulebook)
         self.risk_engine = RiskEngine(rulebook)
 
-    def build_plan(self, snapshot: SecuritySnapshot) -> TradePlan:
+    def build_plan(self, snapshot: SecuritySnapshot, market_override: Optional[str] = None) -> TradePlan:
         market = self.market_engine.evaluate(
             snapshot.active_market_value_pct,
             snapshot.macd_dif,
             snapshot.recent_active_market_values,
+            manual_override=market_override,
         )
         entry_signals = self.entry_engine.evaluate(snapshot, market)
         risk_actions = self.risk_engine.evaluate(snapshot)
@@ -218,6 +266,28 @@ class TradePlanEngine:
             action = "观察/不开新仓"
             suggested_position_pct = 0
             notes.append("空头区间不因买点信号主动进攻。")
+        elif market.regime == MarketRegime.NEUTRAL_WEAK:
+            if score >= 55:
+                action = "观察/仅B1轻仓"
+                suggested_position_pct = market.single_symbol_pct
+                notes.append("震荡偏弱，仅B1信号可轻仓试探，快进快出。")
+            else:
+                action = "观察/不开新仓"
+                suggested_position_pct = 0
+                notes.append("震荡偏弱，信号不足，保守观望。")
+        elif market.regime == MarketRegime.NEUTRAL_BALANCED:
+            if score >= 55:
+                action = "可纳入买入候选"
+                suggested_position_pct = market.single_symbol_pct
+                notes.append("震荡中性，B1信号可参与，注意仓位控制。")
+            elif entry_signals:
+                action = "观察等待确认"
+                suggested_position_pct = max(0, market.single_symbol_pct // 2)
+                notes.append("震荡中性，有信号但强度不足，等待确认。")
+            else:
+                action = "无操作"
+                suggested_position_pct = 0
+                notes.append("震荡中性，未出现足够清晰的进攻信号。")
         elif score >= 55:
             action = "可纳入买入候选"
             suggested_position_pct = market.single_symbol_pct

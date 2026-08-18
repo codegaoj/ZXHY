@@ -137,11 +137,11 @@ def _active_market_value_path() -> Path:
 def _read_active_market_value() -> dict:
     path = _active_market_value_path()
     if not path.exists():
-        return {"date": "", "value": "", "source": "compass", "note": "文件不存在", "recent": [], "cumulative_3d": ""}
+        return {"date": "", "value": "", "source": "compass", "note": "文件不存在", "recent": [], "cumulative_3d": "", "market_regime": "", "market_reason": "", "max_position_pct": ""}
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
     if not rows:
-        return {"date": "", "value": "", "source": "compass", "note": "文件为空", "recent": [], "cumulative_3d": ""}
+        return {"date": "", "value": "", "source": "compass", "note": "文件为空", "recent": [], "cumulative_3d": "", "market_regime": "", "market_reason": "", "max_position_pct": ""}
     row = rows[-1]
     recent = []
     for r in rows[-3:]:
@@ -149,6 +149,25 @@ def _read_active_market_value() -> dict:
         if raw is not None and str(raw).strip() != "":
             recent.append(float(str(raw).strip()))
     cum_sum = round(sum(recent), 4) if recent else 0.0
+    amv = float(row.get("active_market_value_pct", row.get("active_market_value", "0")) or "0")
+
+    market_regime = ""
+    market_reason = ""
+    max_position_pct = ""
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.rulebook import Rulebook
+        from trading_system.engines import MarketTimingEngine
+        rb = Rulebook.load(PROJECT_ROOT / "config" / "rulebook.json")
+        engine = MarketTimingEngine(rb)
+        macd_dif = recent[-1] if recent else 0.0
+        state = engine.evaluate(amv, macd_dif=macd_dif, recent_values=recent)
+        market_regime = state.regime.value
+        market_reason = state.reason
+        max_position_pct = state.max_position_pct
+    except Exception:
+        pass
+
     return {
         "date": row.get("date", ""),
         "value": row.get("active_market_value_pct", row.get("active_market_value", "")),
@@ -156,6 +175,9 @@ def _read_active_market_value() -> dict:
         "note": row.get("note", ""),
         "recent": recent,
         "cumulative_3d": f"{cum_sum:.2f}",
+        "market_regime": market_regime,
+        "market_reason": market_reason,
+        "max_position_pct": max_position_pct,
     }
 
 
@@ -550,8 +572,11 @@ def _append_log(line: str) -> None:
         STATE["log"] = STATE["log"][-500:]
 
 
-def _run_action(action: str) -> None:
+def _run_action(action: str, market_override: str = None) -> None:
     item = COMMANDS[action]
+    cmd = list(item["cmd"])
+    if market_override and action == "screen_candidates":
+        cmd.extend(["--market-override", market_override])
     with STATE_LOCK:
         STATE.update({
             "running": True,
@@ -564,7 +589,7 @@ def _run_action(action: str) -> None:
 
     try:
         proc = subprocess.Popen(
-            item["cmd"],
+            cmd,
             cwd=PROJECT_ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -590,7 +615,7 @@ def _run_action(action: str) -> None:
         STATE["log"].append("完成。" if code == 0 else f"结束，退出码：{code}")
 
 
-def _run_daily_workflow() -> None:
+def _run_daily_workflow(market_override: str = None) -> None:
     """串行执行每日一键执行流程：刷新行情 → 复盘昨日候选股 → 生成今日候选股票。"""
     steps = DAILY_WORKFLOW["steps"]
     total = len(steps)
@@ -607,13 +632,16 @@ def _run_daily_workflow() -> None:
     overall_code = 0
     for idx, step in enumerate(steps, 1):
         item = COMMANDS[step]
+        cmd = list(item["cmd"])
+        if market_override and step == "screen_candidates":
+            cmd.extend(["--market-override", market_override])
         with STATE_LOCK:
             STATE["action"] = f"{DAILY_WORKFLOW['name']} - 第{idx}/{total}步：{item['name']}"
             STATE["log"].append(f"--- 第{idx}/{total}步：{item['name']} ---")
 
         try:
             proc = subprocess.Popen(
-                item["cmd"],
+                cmd,
                 cwd=PROJECT_ROOT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -820,6 +848,19 @@ def _html_page() -> str:
 
     <section>
       <h2>运行流程</h2>
+      <div style="margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <label style="font-weight:600;">市场状态覆盖：</label>
+        <select id="marketOverride" style="padding:6px 12px;border-radius:8px;border:1px solid #ddd;font-size:14px;">
+          <option value="">自动评估（默认）</option>
+          <option value="bull">多头（80%仓位）</option>
+          <option value="neutral_strong">震荡偏强（50%仓位）</option>
+          <option value="neutral_balanced">震荡中性（35%仓位）</option>
+          <option value="neutral_weak">震荡偏弱（20%仓位）</option>
+          <option value="bear">空头（10%仓位）</option>
+        </select>
+        <span id="marketRegimeDisplay" style="padding:4px 12px;border-radius:8px;background:#f0f0f5;font-size:13px;font-weight:600;color:#355cff;">加载中...</span>
+        <span class="hint" style="margin:0;">选择后覆盖系统自动判定，影响选股方向和仓位建议</span>
+      </div>
       <div class="grid">
         <button data-action="refresh_spot"><strong>刷新实时行情</strong><span>拉取全市场行情并缓存到 data/a_spot_latest.csv</span></button>
         <button data-action="daily_report"><strong>生成每日收盘报告</strong><span>基于真实自选股池生成交易计划和 HTML 报告</span></button>
@@ -908,10 +949,11 @@ def _html_page() -> str:
     const copyTdxCodesButton = document.getElementById('copyTdxCodes');
     const loadCandidatesButton = document.getElementById('loadCandidates');
     async function runAction(action) {{
+      const override = document.getElementById('marketOverride').value;
       const res = await fetch('/run', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ action }})
+        body: JSON.stringify({{ action, market_override: override || null }})
       }});
       const data = await res.json();
       if (!data.ok) alert(data.error || '启动失败');
@@ -934,6 +976,19 @@ def _html_page() -> str:
         cumEl.textContent = '仅1天数据';
       }}
       if (data.value) document.getElementById('amvInput').value = data.value;
+      const regimeEl = document.getElementById('marketRegimeDisplay');
+      if (data.market_regime) {{
+        regimeEl.textContent = '系统评估：' + data.market_regime + '（仓位上限 ' + data.max_position_pct + '%）';
+        const regimeColors = {{
+          '多头': '#15803d', '震荡偏强': '#355cff', '震荡中性': '#6b7280',
+          '震荡偏弱': '#b45309', '空头': '#b91c1c'
+        }};
+        regimeEl.style.color = regimeColors[data.market_regime] || '#355cff';
+        regimeEl.title = data.market_reason || '';
+      }} else {{
+        regimeEl.textContent = '系统评估：不可用';
+        regimeEl.style.color = '#6b7280';
+      }}
     }}
     async function saveActiveMarketValue() {{
       const value = document.getElementById('amvInput').value;
@@ -1226,8 +1281,16 @@ def _html_page() -> str:
       document.getElementById('started').textContent = data.started_at || '-';
       document.getElementById('exit').textContent = data.exit_code === null ? '-' : data.exit_code;
       document.getElementById('log').textContent = (data.log || []).join('\\n') || '等待操作...';
+      const logEl = document.getElementById('log');
+      logEl.scrollTop = logEl.scrollHeight;
       buttons.forEach(btn => btn.disabled = data.running);
       saveAmvButton.disabled = data.running;
+      runDailyWorkflowButton.disabled = data.running;
+      if (data.running) {{
+        runDailyWorkflowButton.textContent = '⏳ ' + (data.action || '执行中...');
+      }} else {{
+        runDailyWorkflowButton.textContent = '⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选）';
+      }}
     }}
     buttons.forEach(btn => btn.addEventListener('click', () => runAction(btn.dataset.action)));
     saveAmvButton.addEventListener('click', saveActiveMarketValue);
@@ -1283,25 +1346,29 @@ def _html_page() -> str:
     }}
     const runDailyWorkflowButton = document.getElementById('runDailyWorkflow');
     runDailyWorkflowButton.addEventListener('click', async () => {{
-        if (!confirm('将依次执行：刷新行情缓存→复盘昨日候选股→生成今日候选股票。约需3-5分钟，确认开始？')) return;
+        if (!confirm('将依次执行：刷新行情缓存→复盘昨日候选股→生成今日候选股票。约需5-8分钟，确认开始？')) return;
         runDailyWorkflowButton.disabled = true;
-        runDailyWorkflowButton.textContent = '执行中...';
+        runDailyWorkflowButton.textContent = '⏳ 启动中...';
         try {{
+            const override = document.getElementById('marketOverride').value;
             const res = await fetch('/run', {{
                 method: 'POST',
                 headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify({{action: 'daily_workflow'}})
+                body: JSON.stringify({{action: 'daily_workflow', market_override: override || null}})
             }});
             const data = await res.json();
-            appendLog(`每日一键执行已触发：${{data.message || 'ok'}}`);
-            refreshStatus();
-        }} catch(e) {{
-            appendLog('每日一键执行请求失败：' + e.message);
-        }} finally {{
-            setTimeout(() => {{
+            if (!data.ok) {{
+                alert(data.error || '启动失败');
                 runDailyWorkflowButton.disabled = false;
                 runDailyWorkflowButton.textContent = '⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选）';
-            }}, 5000);
+            }} else {{
+                appendLog(`每日一键执行已触发：${{data.message || 'ok'}}`);
+                refreshStatus();
+            }}
+        }} catch(e) {{
+            appendLog('每日一键执行请求失败：' + e.message);
+            runDailyWorkflowButton.disabled = false;
+            runDailyWorkflowButton.textContent = '⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选）';
         }}
     }});
     refreshActiveMarketValue();
@@ -1391,12 +1458,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "未知接口"}, 404)
             return
         action = payload.get("action")
+        market_override = payload.get("market_override")
         if action == "daily_workflow":
             with STATE_LOCK:
                 if STATE["running"]:
                     self._send_json({"ok": False, "error": "已有任务正在运行，请等待完成"}, 409)
                     return
-            threading.Thread(target=_run_daily_workflow, daemon=True).start()
+            threading.Thread(target=_run_daily_workflow, args=(market_override,), daemon=True).start()
             self._send_json({"ok": True, "message": "每日一键执行已启动"})
             return
         if action not in COMMANDS:
@@ -1406,7 +1474,7 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["running"]:
                 self._send_json({"ok": False, "error": "已有任务正在运行，请等待完成"}, 409)
                 return
-        threading.Thread(target=_run_action, args=(action,), daemon=True).start()
+        threading.Thread(target=_run_action, args=(action, market_override), daemon=True).start()
         self._send_json({"ok": True})
 
     def log_message(self, format: str, *args) -> None:

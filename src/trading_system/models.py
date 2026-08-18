@@ -7,8 +7,30 @@ from typing import Any, Dict, List, Optional
 
 class MarketRegime(str, Enum):
     BULL = "多头"
+    NEUTRAL_STRONG = "震荡偏强"
+    NEUTRAL_BALANCED = "震荡中性"
+    NEUTRAL_WEAK = "震荡偏弱"
     NEUTRAL = "震荡"
     BEAR = "空头"
+
+    @property
+    def is_neutral_family(self) -> bool:
+        return self in (MarketRegime.NEUTRAL, MarketRegime.NEUTRAL_STRONG, MarketRegime.NEUTRAL_BALANCED, MarketRegime.NEUTRAL_WEAK)
+
+    @property
+    def is_bearish(self) -> bool:
+        return self in (MarketRegime.BEAR, MarketRegime.NEUTRAL_WEAK)
+
+    @property
+    def policy_key(self) -> str:
+        return {
+            MarketRegime.BULL: "bull",
+            MarketRegime.NEUTRAL_STRONG: "neutral_strong",
+            MarketRegime.NEUTRAL_BALANCED: "neutral_balanced",
+            MarketRegime.NEUTRAL_WEAK: "neutral_weak",
+            MarketRegime.NEUTRAL: "neutral",
+            MarketRegime.BEAR: "bear",
+        }[self]
 
 
 class SignalDirection(str, Enum):
@@ -84,6 +106,7 @@ class MarketState:
     reason: str
     max_position_pct: int
     single_symbol_pct: int
+    manual_override: bool = False
 
 
 @dataclass

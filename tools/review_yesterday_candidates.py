@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import shutil
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
