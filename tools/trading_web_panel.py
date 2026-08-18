@@ -219,6 +219,17 @@ def _write_active_market_value(value: float, note: str = "") -> dict:
         writer.writerows(existing_rows)
 
     _append_log(f"已更新活跃市值：{text_value}，日期：{today}（累计保留{len(existing_rows)}天）")
+
+    # SQLite 持久化
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            db.save_active_market_value(today, value, value, source="compass", note=note or "通过操作面板更新")
+            _append_log(f"[DB] 活跃市值已入库：{today}")
+    except Exception as exc:
+        _append_log(f"[DB] 活跃市值入库失败：{exc}")
+
     return _read_active_market_value()
 
 
@@ -688,6 +699,52 @@ def _safe_project_file(relative_path: str) -> Path | None:
     if not path.exists() or not path.is_file():
         return None
     return path
+
+
+def _db_summary() -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            return {"ok": True, **db.get_summary()}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _db_candidates(target_date: str) -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            candidates = db.query_daily_candidates(target_date)
+            state = db.get_market_state(target_date)
+            return {"ok": True, "date": target_date, "count": len(candidates), "candidates": candidates, "market_state": state}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _db_reviews(target_date: str) -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            reviews = db.query_candidate_reviews(target_date)
+            stats = db.get_review_stats(target_date)
+            return {"ok": True, "selected_date": target_date, "count": len(reviews), "rows": reviews, "stats": stats}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _db_symbol_history(symbol: str) -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            candidates = db.get_candidate_history(symbol)
+            reviews = db.get_review_history(symbol)
+            return {"ok": True, "symbol": symbol, "candidate_history": candidates, "review_history": reviews}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def _html_page() -> str:
@@ -1413,6 +1470,31 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/history-list"):
             self._send_json(_read_history_list())
+            return
+        if self.path == "/db-summary":
+            self._send_json(_db_summary())
+            return
+        if self.path.startswith("/db-candidates"):
+            parsed = urlparse(self.path)
+            target_date = parse_qs(parsed.query).get("date", [""])[0]
+            if not target_date:
+                target_date = date.today().isoformat()
+            self._send_json(_db_candidates(target_date))
+            return
+        if self.path.startswith("/db-reviews"):
+            parsed = urlparse(self.path)
+            target_date = parse_qs(parsed.query).get("date", [""])[0]
+            if not target_date:
+                target_date = date.today().isoformat()
+            self._send_json(_db_reviews(target_date))
+            return
+        if self.path.startswith("/db-symbol-history"):
+            parsed = urlparse(self.path)
+            symbol = parse_qs(parsed.query).get("symbol", [""])[0]
+            if not symbol:
+                self._send_json({"ok": False, "error": "缺少 symbol 参数"}, 400)
+                return
+            self._send_json(_db_symbol_history(symbol))
             return
         if self.path.startswith("/candidate-detail"):
             parsed = urlparse(self.path)

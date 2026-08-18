@@ -16,6 +16,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import akshare as ak  # type: ignore
 
+from trading_system.storage import Storage
+
 HISTORY_DAYS = 15
 # AkShare 的部分日线接口会调用 py_mini_racer，Windows 下并发调用偶发底层崩溃。
 # 复盘任务只有几十只股票，默认串行执行更稳定。
@@ -530,6 +532,16 @@ def main() -> None:
     shutil.copyfile(json_path, dated_json)
     shutil.copyfile(html_path, dated_html)
     print(f"[历史] 已保存 {selected_date} 的复盘记录到 history/ 目录")
+
+    # ---- SQLite 持久化 ----
+    try:
+        today_str = date.today().isoformat()
+        with Storage() as db:
+            db.save_candidate_reviews(selected_date, today_str, rows)
+            db.save_review_stats(today_str, selected_date, stats)
+            print(f"[DB] 已入库 {selected_date} 的复盘数据 + {len(rows)} 条记录")
+    except Exception as exc:
+        print(f"[DB] 复盘入库失败（不影响主流程）：{exc}")
 
     print(json.dumps({"stats": stats, "json": str(json_path), "html": str(html_path)}, ensure_ascii=False, indent=2))
 

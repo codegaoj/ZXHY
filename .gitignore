@@ -10,3 +10,8 @@ node_modules/
 venv/
 dist/
 build/
+
+# SQLite database (regenerable via tools/migrate_to_sqlite.py)
+*.db
+*.db-wal
+*.db-shm

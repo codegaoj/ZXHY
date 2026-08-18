@@ -25,6 +25,7 @@ from trading_system.rulebook import Rulebook
 from trading_system.chart_quality import evaluate_chart_quality
 from trading_system.agent_review import review_candidates
 from trading_system.sector_analyzer import build_sector_mapping, fetch_sector_performance, get_sector_info, sector_strength_score
+from trading_system.storage import Storage
 
 
 DEFAULT_ACTIVE_MARKET_VALUE_PCT = 4.82
@@ -728,6 +729,24 @@ def main():
     shutil.copyfile(daily_html, dated_html)
     print(f"[历史] 已保存 {today_str} 的候选股记录到 history/ 目录")
 
+    # ---- SQLite 持久化 ----
+    try:
+        with Storage() as db:
+            db.save_market_state(
+                state_date=today_str,
+                regime=market_state.regime.value,
+                active_market_value_pct=active_market_value_pct,
+                macd_above_zero=recent_values[-1] > 0 if recent_values else False,
+                reason=market_state.reason,
+                max_position_pct=market_state.max_position_pct,
+                single_symbol_pct=market_state.single_symbol_pct,
+                manual_override=market_state.manual_override,
+            )
+            db.save_daily_candidates(today_str, rows)
+            print(f"[DB] 已入库 {today_str} 的市场状态 + {len(rows)} 条候选股")
+    except Exception as exc:
+        print(f"[DB] 入库失败（不影响主流程）：{exc}")
+
     # 兼容旧版链接，避免之前的报告入口失效。
     shutil.copyfile(daily_csv, outputs / "next_monday_candidates.csv")
     shutil.copyfile(daily_html, outputs / "next_monday_candidates.html")
@@ -769,6 +788,24 @@ def main():
         print(f"  建议关注: {opinion_counts.get('建议关注', 0)}  谨慎: {opinion_counts.get('谨慎', 0)}  排除: {opinion_counts.get('排除', 0)}")
     except Exception as e:
         print(f"Agent 审核失败: {e}")
+    else:
+        # Agent 审核结果入库
+        try:
+            agent_rows = [
+                {
+                    "symbol": r["symbol"],
+                    "verdict": r.get("opinion"),
+                    "score": r.get("score"),
+                    "issues": r.get("issues"),
+                    "recommendation": r.get("brief"),
+                }
+                for r in review_data["reviews"]
+            ]
+            with Storage() as db:
+                db.save_agent_reviews(today_str, agent_rows)
+                print(f"[DB] 已入库 {len(agent_rows)} 条 Agent 审核")
+        except Exception as exc:
+            print(f"[DB] Agent 审核入库失败：{exc}")
 
     print(json.dumps({"stats": stats, "candidate_count": len(rows), "top": rows[:10]}, ensure_ascii=False, indent=2))
 
