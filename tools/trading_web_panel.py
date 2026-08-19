@@ -489,6 +489,9 @@ def _read_history_list() -> dict:
     }
 
 
+_DETAIL_CACHE: dict[str, tuple[float, "pd.DataFrame"]] = {}
+
+
 def _read_candidate_detail(symbol: str) -> dict:
     symbol = "".join(ch for ch in str(symbol) if ch.isdigit()).zfill(6)
     if len(symbol) != 6:
@@ -501,11 +504,31 @@ def _read_candidate_detail(symbol: str) -> dict:
     import pandas as pd
     from trading_system.data_provider import AkShareProvider
     from trading_system.data_normalizer import calculate_macd
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
-    provider = AkShareProvider(adjust="qfq", retries=2, pause_seconds=0.6)
     end = date.today()
     start = end - timedelta(days=180)
-    raw = provider.fetch_daily(symbol, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+
+    cache_key = f"{symbol}_{start}_{end}"
+    now = time.time()
+    cached = _DETAIL_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < 1800:
+        raw = cached[1]
+    else:
+        provider = AkShareProvider(adjust="qfq", retries=1, pause_seconds=0.4)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    lambda p: p.fetch_daily(symbol, start.strftime("%Y%m%d"), end.strftime("%Y%m%d")),
+                    provider,
+                )
+                raw = future.result(timeout=20)
+            _DETAIL_CACHE[cache_key] = (now, raw)
+        except FutureTimeout:
+            return {"ok": False, "error": f"拉取 {symbol} 日线超时（20秒），请稍后重试。"}
+        except Exception as exc:
+            return {"ok": False, "error": f"拉取日线失败：{exc}"}
+
     df = _normalize_detail_daily(raw)
     # 用实时行情补全今日数据（东方财富不可用时日线可能缺今天）
     df = _supplement_with_spot(df, symbol)
