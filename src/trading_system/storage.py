@@ -149,9 +149,44 @@ CREATE TABLE IF NOT EXISTS trade_plans (
     PRIMARY KEY (date, symbol)
 );
 
+CREATE TABLE IF NOT EXISTS holdings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    name TEXT,
+    buy_date TEXT NOT NULL,
+    buy_price REAL NOT NULL,
+    shares INTEGER NOT NULL,
+    cost_price REAL,
+    commission REAL DEFAULT 0,
+    status TEXT DEFAULT 'open',
+    note TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    updated_at TEXT DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    holding_id INTEGER,
+    symbol TEXT NOT NULL,
+    name TEXT,
+    type TEXT NOT NULL,
+    date TEXT NOT NULL,
+    price REAL NOT NULL,
+    shares INTEGER NOT NULL,
+    amount REAL,
+    commission REAL DEFAULT 0,
+    pnl REAL,
+    pnl_pct REAL,
+    note TEXT,
+    FOREIGN KEY (holding_id) REFERENCES holdings(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_snapshots_symbol ON market_snapshots(symbol);
 CREATE INDEX IF NOT EXISTS idx_candidates_date ON daily_candidates(date);
 CREATE INDEX IF NOT EXISTS idx_reviews_symbol ON candidate_reviews(symbol);
+CREATE INDEX IF NOT EXISTS idx_holdings_symbol ON holdings(symbol);
+CREATE INDEX IF NOT EXISTS idx_holdings_status ON holdings(status);
+CREATE INDEX IF NOT EXISTS idx_transactions_symbol ON transactions(symbol);
 """
 
 
@@ -552,6 +587,8 @@ class Storage:
             "review_stats",
             "agent_reviews",
             "trade_plans",
+            "holdings",
+            "transactions",
         ]
         result = {}
         for table in tables:
@@ -574,4 +611,137 @@ class Storage:
             "SELECT * FROM candidate_reviews WHERE symbol=? ORDER BY selected_date DESC LIMIT ?",
             (symbol, limit),
         )
+        return [dict(r) for r in cur.fetchall()]
+
+    # ─── holdings ───
+
+    def add_holding(
+        self,
+        symbol: str,
+        name: str,
+        buy_date: str,
+        buy_price: float,
+        shares: int,
+        commission: float = 0.0,
+        note: str = "",
+    ) -> int:
+        cost_price = buy_price + (commission / shares if shares else 0)
+        cur = self.conn.execute(
+            "INSERT INTO holdings "
+            "(symbol,name,buy_date,buy_price,shares,cost_price,commission,status,note) "
+            "VALUES (?,?,?,?,?,?,?, 'open', ?)",
+            (symbol, name, buy_date, buy_price, shares, cost_price, commission, note),
+        )
+        holding_id = cur.lastrowid
+        self.conn.execute(
+            "INSERT INTO transactions (holding_id,symbol,name,type,date,price,shares,amount,commission,note) "
+            "VALUES (?,?,?, 'buy', ?, ?, ?, ?, ?, ?)",
+            (holding_id, symbol, name, buy_date, buy_price, shares,
+             buy_price * shares, commission, note or "买入"),
+        )
+        self.conn.commit()
+        return holding_id
+
+    def update_holding(self, holding_id: int, **fields) -> None:
+        allowed = {"symbol", "name", "buy_date", "buy_price", "shares",
+                    "cost_price", "commission", "status", "note"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        sets = ", ".join(f"{k}=?" for k in updates)
+        vals = list(updates.values()) + [holding_id]
+        self.conn.execute(
+            f"UPDATE holdings SET {sets}, updated_at=datetime('now','localtime') WHERE id=?",
+            vals,
+        )
+        self.conn.commit()
+
+    def delete_holding(self, holding_id: int) -> None:
+        self.conn.execute("DELETE FROM transactions WHERE holding_id=?", (holding_id,))
+        self.conn.execute("DELETE FROM holdings WHERE id=?", (holding_id,))
+        self.conn.commit()
+
+    def get_open_holdings(self) -> List[dict]:
+        cur = self.conn.execute(
+            "SELECT * FROM holdings WHERE status='open' ORDER BY buy_date DESC"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_all_holdings(self, limit: int = 100) -> List[dict]:
+        cur = self.conn.execute(
+            "SELECT * FROM holdings ORDER BY buy_date DESC LIMIT ?", (limit,)
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_holding(self, holding_id: int) -> Optional[dict]:
+        cur = self.conn.execute(
+            "SELECT * FROM holdings WHERE id=?", (holding_id,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def close_holding(
+        self,
+        holding_id: int,
+        sell_date: str,
+        sell_price: float,
+        sell_shares: int,
+        commission: float = 0.0,
+        note: str = "",
+    ) -> dict:
+        holding = self.get_holding(holding_id)
+        if not holding:
+            raise ValueError(f"持仓 ID {holding_id} 不存在")
+        symbol = holding["symbol"]
+        name = holding["name"] or ""
+        buy_price = holding["buy_price"]
+        cost = buy_price * sell_shares + (holding.get("commission", 0) or 0) * (sell_shares / max(holding["shares"], 1))
+        revenue = sell_price * sell_shares - commission
+        pnl = revenue - cost
+        pnl_pct = (pnl / cost * 100) if cost else 0.0
+        self.conn.execute(
+            "INSERT INTO transactions "
+            "(holding_id,symbol,name,type,date,price,shares,amount,commission,pnl,pnl_pct,note) "
+            "VALUES (?,?,?, 'sell', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (holding_id, symbol, name, sell_date, sell_price, sell_shares,
+             sell_price * sell_shares, commission, pnl, pnl_pct, note or "卖出"),
+        )
+        remaining = holding["shares"] - sell_shares
+        if remaining <= 0:
+            self.update_holding(holding_id, status="closed")
+        else:
+            self.update_holding(holding_id, shares=remaining)
+        self.conn.commit()
+        return {"pnl": pnl, "pnl_pct": pnl_pct, "remaining_shares": max(remaining, 0)}
+
+    def import_holdings_csv(self, rows: List[Dict[str, Any]]) -> int:
+        count = 0
+        for r in rows:
+            try:
+                self.add_holding(
+                    symbol=str(r.get("symbol", "")).strip().zfill(6),
+                    name=r.get("name", "").strip(),
+                    buy_date=r.get("buy_date", "").strip(),
+                    buy_price=float(r.get("buy_price", 0)),
+                    shares=int(r.get("shares", 0)),
+                    commission=float(r.get("commission", 0) or 0),
+                    note=r.get("note", "").strip(),
+                )
+                count += 1
+            except Exception:
+                continue
+        return count
+
+    # ─── transactions ───
+
+    def get_transactions(self, symbol: str = "", limit: int = 100) -> List[dict]:
+        if symbol:
+            cur = self.conn.execute(
+                "SELECT * FROM transactions WHERE symbol=? ORDER BY date DESC LIMIT ?",
+                (symbol, limit),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT * FROM transactions ORDER BY date DESC LIMIT ?", (limit,)
+            )
         return [dict(r) for r in cur.fetchall()]

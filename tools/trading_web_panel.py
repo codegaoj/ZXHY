@@ -770,6 +770,108 @@ def _db_symbol_history(symbol: str) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def _holdings_list() -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            return {"ok": True, "holdings": db.get_open_holdings()}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _holdings_signals() -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.portfolio_engine import PortfolioEngine
+        engine = PortfolioEngine()
+        results = engine.check_holdings()
+        return {"ok": True, "count": len(results), "holdings": results}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _holdings_add(payload: dict) -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            hid = db.add_holding(
+                symbol=str(payload.get("symbol", "")).strip().zfill(6),
+                name=payload.get("name", "").strip(),
+                buy_date=payload.get("buy_date", ""),
+                buy_price=float(payload.get("buy_price", 0)),
+                shares=int(payload.get("shares", 0)),
+                commission=float(payload.get("commission", 0) or 0),
+                note=payload.get("note", "").strip(),
+            )
+            return {"ok": True, "id": hid}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _holdings_update(holding_id: int, payload: dict) -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            db.update_holding(holding_id, **payload)
+            return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _holdings_delete(holding_id: int) -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            db.delete_holding(holding_id)
+            return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _holdings_sell(holding_id: int, payload: dict) -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            result = db.close_holding(
+                holding_id,
+                sell_date=payload.get("sell_date", ""),
+                sell_price=float(payload.get("sell_price", 0)),
+                sell_shares=int(payload.get("sell_shares", 0)),
+                commission=float(payload.get("commission", 0) or 0),
+                note=payload.get("note", "").strip(),
+            )
+            return {"ok": True, **result}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _holdings_import(payload: dict) -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        rows = payload.get("rows", [])
+        with Storage() as db:
+            count = db.import_holdings_csv(rows)
+            return {"ok": True, "imported": count}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _transactions_list(symbol: str = "") -> dict:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            return {"ok": True, "transactions": db.get_transactions(symbol)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def _html_page() -> str:
     links = "\n".join(
         f'<a class="report-link" href="/view/{path}" target="_blank"><span>{name}</span><small>{path}</small></a>'
@@ -1018,6 +1120,46 @@ def _html_page() -> str:
     <section>
       <h2>运行日志</h2>
       <pre id="log">等待操作...</pre>
+    </section>
+
+    <section>
+      <h2>持股管理</h2>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center;">
+        <button id="btnCheckHoldings" onclick="checkHoldings()">检查持仓（卖出信号+盈亏）</button>
+        <button id="btnAddHolding" onclick="showAddHoldingForm()">添加持仓</button>
+        <button onclick="loadTransactions()">交易流水</button>
+      </div>
+      <div id="addHoldingForm" style="display:none;background:var(--bg);border:1px solid var(--rule);border-radius:8px;padding:12px;margin-bottom:12px;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;">
+          <input id="hfSymbol" placeholder="代码 如 601963" style="padding:6px;border:1px solid var(--rule);border-radius:6px;" />
+          <input id="hfName" placeholder="名称" style="padding:6px;border:1px solid var(--rule);border-radius:6px;" />
+          <input id="hfDate" type="date" style="padding:6px;border:1px solid var(--rule);border-radius:6px;" />
+          <input id="hfPrice" type="number" step="0.01" placeholder="买入价" style="padding:6px;border:1px solid var(--rule);border-radius:6px;" />
+          <input id="hfShares" type="number" placeholder="股数" style="padding:6px;border:1px solid var(--rule);border-radius:6px;" />
+          <input id="hfCommission" type="number" step="0.01" placeholder="手续费" style="padding:6px;border:1px solid var(--rule);border-radius:6px;" />
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px;">
+          <button onclick="submitAddHolding()">确认添加</button>
+          <button onclick="document.getElementById('addHoldingForm').style.display='none'">取消</button>
+        </div>
+      </div>
+      <div id="holdingsTable" style="overflow-x:auto;"></div>
+      <div id="sellModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.4);z-index:999;align-items:center;justify-content:center;">
+        <div style="background:var(--bg2);border-radius:12px;padding:20px;max-width:420px;width:90%;">
+          <h3>确认卖出</h3>
+          <div id="sellInfo" style="margin:8px 0;font-size:14px;color:var(--muted);"></div>
+          <div style="display:grid;gap:8px;">
+            <input id="sellDate" type="date" style="padding:6px;border:1px solid var(--rule);border-radius:6px;" />
+            <input id="sellPrice" type="number" step="0.01" placeholder="卖出价" style="padding:6px;border:1px solid var(--rule);border-radius:6px;" />
+            <input id="sellShares" type="number" placeholder="卖出股数" style="padding:6px;border:1px solid var(--rule);border-radius:6px;" />
+            <input id="sellCommission" type="number" step="0.01" placeholder="手续费" value="0" style="padding:6px;border:1px solid var(--rule);border-radius:6px;" />
+          </div>
+          <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;">
+            <button onclick="confirmSell()">确认卖出</button>
+            <button onclick="document.getElementById('sellModal').style.display='none'">取消</button>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 
@@ -1455,6 +1597,147 @@ def _html_page() -> str:
     loadCandidateList();
     refreshStatus();
     setInterval(refreshStatus, 1500);
+
+    // ─── 持仓管理 ───
+    let currentSellId = null;
+    async function checkHoldings() {{
+      const btn = document.getElementById('btnCheckHoldings');
+      btn.disabled = true; btn.textContent = '正在检查持仓...';
+      const el = document.getElementById('holdingsTable');
+      el.innerHTML = '<div style="color:var(--muted);">正在拉取行情并检测卖出信号，请稍候...</div>';
+      try {{
+        const res = await fetch('/holdings/signals');
+        const data = await res.json();
+        if (!data.ok) {{ el.innerHTML = '<div style="color:var(--danger);">错误：' + data.error + '</div>'; return; }}
+        renderHoldings(data.holdings || []);
+      }} catch (e) {{
+        el.innerHTML = '<div style="color:var(--danger);">请求失败：' + e.message + '</div>';
+      }} finally {{
+        btn.disabled = false; btn.textContent = '检查持仓（卖出信号+盈亏）';
+      }}
+    }}
+    function renderHoldings(holdings) {{
+      const el = document.getElementById('holdingsTable');
+      if (!holdings.length) {{ el.innerHTML = '<div style="color:var(--muted);">暂无持仓记录。点击"添加持仓"按钮录入。</div>'; return; }}
+      let html = '<table style="width:100%;border-collapse:collapse;font-size:13px;"><thead><tr style="background:var(--bg);">';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">代码</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">名称</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">买入日期</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">买入价</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">股数</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">现价</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">市值</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">盈亏</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">盈亏%</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">R/R</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">卖出信号</th>';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">操作</th>';
+      html += '</tr></thead><tbody>';
+      holdings.forEach(h => {{
+        const pnlColor = h.pnl >= 0 ? 'var(--success)' : 'var(--danger)';
+        const signals = (h.signals || []).map(s => '<span style="background:' + (s.priority <= 1 ? '#fde8e8' : s.priority === 2 ? '#fff3e0' : '#e3f2fd') + ';color:' + (s.priority <= 1 ? 'var(--danger)' : s.priority === 2 ? '#e65100' : '#1565c0') + ';padding:2px 6px;border-radius:4px;font-size:11px;margin:1px;display:inline-block;">' + s.rule + '</span>').join('');
+        const errNote = h.error ? '<span style="color:var(--danger);font-size:11px;">' + h.error + '</span>' : '';
+        html += '<tr>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + h.symbol + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (h.name || '') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + h.buy_date + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + h.buy_price + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + h.shares + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (h.current_price || '—') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (h.market_value != null ? h.market_value.toLocaleString() : '—') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);color:' + pnlColor + ';">' + (h.pnl != null ? h.pnl.toFixed(2) : '—') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);color:' + pnlColor + ';">' + (h.pnl_pct != null ? h.pnl_pct.toFixed(2) + '%' : '—') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (h.rr != null ? h.rr : '—') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (signals || errNote || '—') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);"><button onclick="showSellModal(' + h.id + ',' + (h.shares || 0) + ',\'' + (h.symbol || '') + '\',\'' + (h.name || '') + '\',\'' + (h.buy_price || 0) + '\')" style="padding:3px 8px;font-size:11px;">卖出</button> <button onclick="deleteHolding(' + h.id + ')" style="padding:3px 8px;font-size:11px;color:var(--danger);">删除</button></td>';
+        html += '</tr>';
+      }});
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    }}
+    function showAddHoldingForm() {{
+      document.getElementById('addHoldingForm').style.display = 'block';
+      document.getElementById('hfDate').value = new Date().toISOString().slice(0, 10);
+    }}
+    async function submitAddHolding() {{
+      const payload = {{
+        symbol: document.getElementById('hfSymbol').value,
+        name: document.getElementById('hfName').value,
+        buy_date: document.getElementById('hfDate').value,
+        buy_price: parseFloat(document.getElementById('hfPrice').value),
+        shares: parseInt(document.getElementById('hfShares').value),
+        commission: parseFloat(document.getElementById('hfCommission').value) || 0,
+      }};
+      if (!payload.symbol || !payload.buy_date || !payload.buy_price || !payload.shares) {{
+        alert('请填写代码、日期、买入价和股数'); return;
+      }}
+      const res = await fetch('/holdings', {{ method: 'POST', headers: {{'Content-Type':'application/json'}}, body: JSON.stringify(payload) }});
+      const data = await res.json();
+      if (data.ok) {{ alert('添加成功'); document.getElementById('addHoldingForm').style.display = 'none'; checkHoldings(); }}
+      else {{ alert('添加失败：' + data.error); }}
+    }}
+    function showSellModal(id, shares, symbol, name, buyPrice) {{
+      currentSellId = id;
+      document.getElementById('sellInfo').textContent = symbol + ' ' + name + ' | 持仓 ' + shares + ' 股 | 买入价 ' + buyPrice;
+      document.getElementById('sellDate').value = new Date().toISOString().slice(0, 10);
+      document.getElementById('sellShares').value = shares;
+      document.getElementById('sellPrice').value = '';
+      document.getElementById('sellModal').style.display = 'flex';
+    }}
+    async function confirmSell() {{
+      if (!currentSellId) return;
+      const payload = {{
+        sell_date: document.getElementById('sellDate').value,
+        sell_price: parseFloat(document.getElementById('sellPrice').value),
+        sell_shares: parseInt(document.getElementById('sellShares').value),
+        commission: parseFloat(document.getElementById('sellCommission').value) || 0,
+      }};
+      if (!payload.sell_date || !payload.sell_price || !payload.sell_shares) {{ alert('请填写日期、卖出价和股数'); return; }}
+      const res = await fetch('/holdings/' + currentSellId + '/sell', {{ method: 'POST', headers: {{'Content-Type':'application/json'}}, body: JSON.stringify(payload) }});
+      const data = await res.json();
+      if (data.ok) {{
+        alert('卖出成功！盈亏：' + data.pnl.toFixed(2) + ' 元 (' + data.pnl_pct.toFixed(2) + '%)');
+        document.getElementById('sellModal').style.display = 'none';
+        checkHoldings();
+      }} else {{
+        alert('卖出失败：' + data.error);
+      }}
+    }}
+    async function deleteHolding(id) {{
+      if (!confirm('确定删除此持仓记录？相关交易流水也会一并删除。')) return;
+      const res = await fetch('/holdings/' + id, {{ method: 'DELETE' }});
+      const data = await res.json();
+      if (data.ok) {{ checkHoldings(); }} else {{ alert('删除失败：' + data.error); }}
+    }}
+    async function loadTransactions() {{
+      const el = document.getElementById('holdingsTable');
+      el.innerHTML = '<div style="color:var(--muted);">加载中...</div>';
+      const res = await fetch('/transactions');
+      const data = await res.json();
+      if (!data.ok) {{ el.innerHTML = '<div style="color:var(--danger);">错误：' + data.error + '</div>'; return; }}
+      const txns = data.transactions || [];
+      if (!txns.length) {{ el.innerHTML = '<div style="color:var(--muted);">暂无交易记录。</div>'; return; }}
+      let html = '<table style="width:100%;border-collapse:collapse;font-size:13px;"><thead><tr style="background:var(--bg);">';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">日期</th><th style="padding:6px;border:1px solid var(--rule);">代码</th><th style="padding:6px;border:1px solid var(--rule);">名称</th><th style="padding:6px;border:1px solid var(--rule);">类型</th><th style="padding:6px;border:1px solid var(--rule);">价格</th><th style="padding:6px;border:1px solid var(--rule);">股数</th><th style="padding:6px;border:1px solid var(--rule);">金额</th><th style="padding:6px;border:1px solid var(--rule);">盈亏</th><th style="padding:6px;border:1px solid var(--rule);">盈亏%</th>';
+      html += '</tr></thead><tbody>';
+      txns.forEach(t => {{
+        const isBuy = t.type === 'buy';
+        const pnlColor = (t.pnl || 0) >= 0 ? 'var(--success)' : 'var(--danger)';
+        html += '<tr>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + t.date + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + t.symbol + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (t.name || '') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);color:' + (isBuy ? 'var(--accent)' : 'var(--danger)') + ';">' + (isBuy ? '买入' : '卖出') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + t.price + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + t.shares + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (t.amount || 0).toFixed(0) + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);color:' + pnlColor + ';">' + (t.pnl != null ? t.pnl.toFixed(2) : '—') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);color:' + pnlColor + ';">' + (t.pnl_pct != null ? t.pnl_pct.toFixed(2) + '%' : '—') + '</td>';
+        html += '</tr>';
+      }});
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    }}
   </script>
 </body>
 </html>"""
@@ -1519,6 +1802,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(_db_symbol_history(symbol))
             return
+        if self.path == "/holdings":
+            self._send_json(_holdings_list())
+            return
+        if self.path == "/holdings/signals":
+            self._send_json(_holdings_signals())
+            return
+        if self.path.startswith("/transactions"):
+            parsed = urlparse(self.path)
+            symbol = parse_qs(parsed.query).get("symbol", [""])[0]
+            self._send_json(_transactions_list(symbol))
+            return
         if self.path.startswith("/candidate-detail"):
             parsed = urlparse(self.path)
             symbol = parse_qs(parsed.query).get("symbol", [""])[0]
@@ -1559,6 +1853,27 @@ class Handler(BaseHTTPRequestHandler):
             data = _write_active_market_value(value, note)
             self._send_json({"ok": True, **data})
             return
+        if self.path == "/holdings":
+            self._send_json(_holdings_add(payload))
+            return
+        if self.path.startswith("/holdings/"):
+            parts = self.path.split("/")
+            if len(parts) >= 3:
+                try:
+                    holding_id = int(parts[2])
+                except ValueError:
+                    self._send_json({"ok": False, "error": "无效的持仓 ID"}, 400)
+                    return
+                if len(parts) >= 4 and parts[3] == "sell":
+                    self._send_json(_holdings_sell(holding_id, payload))
+                    return
+                if len(parts) >= 4 and parts[3] == "import":
+                    self._send_json(_holdings_import(payload))
+                    return
+                self._send_json(_holdings_update(holding_id, payload))
+                return
+            self._send_json({"ok": False, "error": "无效路径"}, 400)
+            return
         if self.path != "/run":
             self._send_json({"ok": False, "error": "未知接口"}, 404)
             return
@@ -1584,6 +1899,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args) -> None:
         return
+
+    def do_DELETE(self) -> None:
+        if self.path.startswith("/holdings/"):
+            parts = self.path.split("/")
+            if len(parts) >= 3:
+                try:
+                    holding_id = int(parts[2])
+                except ValueError:
+                    self._send_json({"ok": False, "error": "无效的持仓 ID"}, 400)
+                    return
+                self._send_json(_holdings_delete(holding_id))
+                return
+        self._send_json({"ok": False, "error": "无效路径"}, 400)
 
 
 def main() -> None:
