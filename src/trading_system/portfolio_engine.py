@@ -11,6 +11,7 @@ import pandas as pd
 from .storage import Storage, DB_PATH
 from .data_provider import AkShareProvider
 from .data_normalizer import calculate_macd
+from .trade_calendar import last_trading_day
 
 PROJECT_ROOT = Path(r"g:\BaiduNetdiskDownload\z直播文字\trading-system-core")
 
@@ -25,7 +26,7 @@ class PortfolioEngine:
         cached = self._cache.get(symbol)
         if cached and (now - cached[0]) < 300:
             return cached[1]
-        end = date.today()
+        end = last_trading_day()
         start = end - timedelta(days=180)
         try:
             raw = self.provider.fetch_daily(

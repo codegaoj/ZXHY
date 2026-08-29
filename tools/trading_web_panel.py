@@ -306,11 +306,26 @@ def _get_spot_df():
         return _SPOT_CACHE["df"]
 
 
+def _is_trading_day(d: date | None = None) -> bool:
+    """判断是否为交易日（使用 AkShare 交易日历，回退到周末判断）。"""
+    from trading_system.trade_calendar import is_trading_day as _tc_is_trading_day
+    return _tc_is_trading_day(d)
+
+
+def _last_trading_day(d: date | None = None) -> date:
+    """返回最近一个交易日，如果当天是交易日则返回当天，否则往前推。"""
+    from trading_system.trade_calendar import last_trading_day as _tc_last_trading_day
+    return _tc_last_trading_day(d)
+
+
 def _supplement_with_spot(df, symbol: str):
-    """如果日线数据不含今天，用实时行情补一行今日数据。"""
+    """如果日线数据不含今天，用实时行情补一行今日数据（仅交易日补全）。"""
     import pandas as pd
 
     if df is None or df.empty:
+        return df
+    # 非交易日不补全，避免周六日出现假K线
+    if not _is_trading_day():
         return df
     today_str = date.today().isoformat()
     last_date = str(df.iloc[-1]["date"]).split(" ")[0]
@@ -506,7 +521,7 @@ def _read_candidate_detail(symbol: str) -> dict:
     from trading_system.data_normalizer import calculate_macd
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
-    end = date.today()
+    end = _last_trading_day()
     start = end - timedelta(days=180)
 
     cache_key = f"{symbol}_{start}_{end}"
@@ -571,6 +586,7 @@ def _read_candidate_detail(symbol: str) -> dict:
             "close": round(float(row["close"]), 4),
             "high": round(float(row["high"]), 4),
             "low": round(float(row["low"]), 4),
+            "volume": int(row.get("volume", 0) or 0),
             "white": round(float(row["white_line"]), 4),
             "yellow": round(float(row["yellow_line"]), 4),
             "dif": round(float(row["macd_dif"]), 4),
@@ -971,7 +987,7 @@ def _html_page() -> str:
     .candidate-item span {{ font-size: 12px; }}
     .candidate-item.active {{ border-color: var(--accent); box-shadow: 0 0 0 2px rgba(53,92,255,.12); }}
     .chart-card {{ border: 1px solid var(--rule); border-radius: 14px; background: var(--bg); padding: 14px; min-height: 560px; }}
-    .chart-meta {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin: 12px 0; }}
+    .chart-meta {{ display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin: 12px 0; }}
     .chart-wrap {{ width: 100%; overflow: auto; background: #fff; border: 1px solid var(--rule); border-radius: 14px; }}
     .chart-wrap svg {{ display: block; width: 100%; min-width: 760px; height: auto; }}
     .candidate-reason {{ margin-top: 10px; color: var(--muted); font-size: 13px; }}
@@ -987,12 +1003,27 @@ def _html_page() -> str:
     .agent-recs {{ background: #e8f5e9; border: 1px solid #4caf50; border-radius: 10px; padding: 10px 14px; margin-bottom: 10px; font-size: 13px; }}
     .agent-recs ul {{ margin: 6px 0 0; padding-left: 20px; }}
     .agent-recs li {{ margin-bottom: 4px; }}
-    .agent-review-card {{ border: 1px solid var(--rule); border-radius: 10px; padding: 10px 12px; margin-bottom: 6px; background: #fff; font-size: 13px; }}
-    .agent-review-card .review-header {{ display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }}
+    .agent-review-card {{ border: 1px solid var(--rule); border-radius: 10px; padding: 8px 12px; margin-bottom: 4px; background: #fff; font-size: 13px; cursor: pointer; transition: border-color .12s ease; }}
+    .agent-review-card:hover {{ border-color: var(--accent); }}
+    .agent-review-card .review-header {{ display: flex; align-items: center; gap: 8px; }}
+    .agent-review-card .card-detail {{ display: none; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--rule); }}
+    .agent-review-card.expanded .card-detail {{ display: block; }}
+    .agent-review-card .toggle-icon {{ margin-left: auto; color: var(--muted); font-size: 11px; }}
+    .agent-review-card.expanded .toggle-icon::before {{ content: '收起 ▴'; }}
+    .agent-review-card .toggle-icon::before {{ content: '展开 ▾'; }}
+    .agent-review-list {{ max-height: 560px; overflow-y: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 6px; align-content: start; }}
+    .agent-toggle-bar {{ display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }}
+    .agent-toggle-bar button {{ padding: 4px 10px; font-size: 12px; border-radius: 6px; border: 1px solid var(--rule); background: var(--bg); cursor: pointer; }}
     .agent-review-card .review-brief {{ color: var(--muted); font-size: 12px; }}
     .risk-badge {{ display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; color: white; }}
     .highlight-text {{ color: #178a54; font-size: 12px; }}
     .issue-text {{ color: #b9382f; font-size: 12px; }}
+    .tab-nav {{ display: flex; gap: 2px; margin-bottom: 16px; border-bottom: 2px solid var(--rule); padding-left: 4px; }}
+    .tab-btn {{ padding: 10px 18px; border: none; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 15px; border-bottom: 3px solid transparent; margin-bottom: -2px; transition: color .12s ease, border-color .12s ease; }}
+    .tab-btn:hover {{ color: var(--ink); }}
+    .tab-btn.active {{ color: var(--accent); border-bottom-color: var(--accent); font-weight: 700; }}
+    section[data-tab] {{ display: none; }}
+    section[data-tab].active {{ display: block; }}
     @media (max-width: 980px) {{ .grid, .reports, .status {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
     @media (max-width: 900px) {{ .candidate-layout {{ grid-template-columns: 1fr; }} }}
     @media (max-width: 620px) {{ main {{ width: calc(100% - 20px); }} .grid, .reports, .status, .chart-meta {{ grid-template-columns: 1fr; }} }}
@@ -1011,7 +1042,15 @@ def _html_page() -> str:
       </div>
     </header>
 
-    <section>
+    <nav class="tab-nav">
+      <button class="tab-btn active" data-tab="dashboard">仪表盘</button>
+      <button class="tab-btn" data-tab="screening">选股执行</button>
+      <button class="tab-btn" data-tab="holdings">持仓管理</button>
+      <button class="tab-btn" data-tab="reports">报告与历史</button>
+      <button class="tab-btn" data-tab="log">运行日志</button>
+    </nav>
+
+    <section data-tab="dashboard" class="active">
       <h2>活跃市值</h2>
       <p>先填写当天指南针活跃市值，再生成报告或每日候选股票。当前值写入 data/compass_active_market_value.csv。多头判定规则：单日 >= 4% 或近3日累计 >= 4%。</p>
       <div class="status">
@@ -1020,6 +1059,19 @@ def _html_page() -> str:
         <div class="stat"><span>近3日累计</span><strong id="amvCumulative">读取中</strong></div>
         <div class="stat"><span>来源</span><strong id="amvSource">-</strong></div>
         <div class="stat"><span>备注</span><strong id="amvNote">-</strong></div>
+        <div class="stat"><span>市场状态</span><strong id="amvRegime" style="color:var(--accent);">读取中</strong></div>
+      </div>
+      <div style="margin-top:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <label style="font-weight:600;">市场状态覆盖：</label>
+        <select id="marketOverrideDash" style="padding:6px 12px;border-radius:8px;border:1px solid #ddd;font-size:14px;">
+          <option value="">自动评估（默认）</option>
+          <option value="bull">多头（80%仓位）</option>
+          <option value="neutral_strong">震荡偏强（50%仓位）</option>
+          <option value="neutral_balanced">震荡中性（35%仓位）</option>
+          <option value="neutral_weak">震荡偏弱（20%仓位）</option>
+          <option value="bear">空头（10%仓位）</option>
+        </select>
+        <span style="font-size:13px;color:var(--muted);">选择后覆盖系统判定，影响选股和仓位</span>
       </div>
       <div class="form-row">
         <label><span>新活跃市值</span><input id="amvInput" type="number" step="0.01" placeholder="例如 4.82"></label>
@@ -1028,7 +1080,7 @@ def _html_page() -> str:
       </div>
     </section>
 
-    <section>
+    <section data-tab="screening">
       <h2>运行流程</h2>
       <div style="margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
         <label style="font-weight:600;">市场状态覆盖：</label>
@@ -1059,19 +1111,19 @@ def _html_page() -> str:
       <div class="hint">执行顺序：先刷新实时行情，再复盘昨日候选股（用今天行情对比昨天选入价），最后生成今天的候选股。首次使用无历史备份时复盘会跳过，第二天起正常工作。</div>
     </section>
 
-    <section>
+    <section data-tab="reports">
       <h2>打开报告</h2>
       <div class="reports">
         {links}
       </div>
     </section>
 
-    <section>
+    <section data-tab="reports">
       <h2>历史记录 <button id="loadHistory" type="button" class="primary-button" style="font-size:13px;padding:6px 14px;">刷新历史列表</button></h2>
       <div id="historyList" class="hint">点击"刷新历史列表"查看所有历史候选股和复盘记录。</div>
     </section>
 
-    <section>
+    <section data-tab="reports">
       <h2>通达信导入文本</h2>
       <p>点击按钮后展示股票代码文本，可直接复制到通达信自选股/自定义板块导入窗口。</p>
       <div class="tdx-actions">
@@ -1085,7 +1137,7 @@ def _html_page() -> str:
       </div>
     </section>
 
-    <section>
+    <section data-tab="screening">
       <h2>候选股指标拆解</h2>
       <p>点击左侧某只候选股，查看最近60日K线、知行短期趋势线、知行多空线、MACD、砖型图、支撑位和压力位。</p>
       <div class="candidate-layout">
@@ -1100,6 +1152,7 @@ def _html_page() -> str:
             <div class="stat"><span>白线/黄线</span><strong id="detailLines">-</strong></div>
             <div class="stat"><span>MACD DIF/DEA</span><strong id="detailMacd">-</strong></div>
             <div class="stat"><span>砖型图</span><strong id="detailBrick">-</strong></div>
+            <div class="stat"><span>成交量</span><strong id="detailVolume">-</strong></div>
             <div class="stat"><span>支撑/压力</span><strong id="detailRange">-</strong></div>
           </div>
           <div class="chart-wrap" id="candidateChart"><div class="hint">图表会显示在这里。</div></div>
@@ -1108,21 +1161,26 @@ def _html_page() -> str:
       </div>
     </section>
 
-    <section class="agent-section">
+    <section class="agent-section" data-tab="screening">
       <h2>Agent 审核报告</h2>
       <div class="agent-summary" id="agentSummary">点击"刷新候选股列表"后自动加载审核结果。</div>
       <div class="agent-stats" id="agentStats"></div>
       <div id="agentWarnings"></div>
       <div id="agentRecs"></div>
-      <div id="agentReviewList"></div>
+      <div class="agent-toggle-bar" id="agentToggleBar" style="display:none;">
+        <button id="expandAllReviews" type="button">展开全部</button>
+        <button id="collapseAllReviews" type="button">收起全部</button>
+        <span style="font-size:12px;color:var(--muted);">点击卡片可展开/收起详情</span>
+      </div>
+      <div class="agent-review-list" id="agentReviewList"></div>
     </section>
 
-    <section>
+    <section data-tab="log">
       <h2>运行日志</h2>
       <pre id="log">等待操作...</pre>
     </section>
 
-    <section>
+    <section data-tab="holdings">
       <h2>持股管理</h2>
       <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center;">
         <button id="btnCheckHoldings" onclick="checkHoldings()">检查持仓（卖出信号+盈亏）</button>
@@ -1164,6 +1222,21 @@ def _html_page() -> str:
   </main>
 
   <script>
+    // ─── Tab 切换 ───
+    document.querySelectorAll('.tab-btn').forEach(btn => {{
+      btn.addEventListener('click', () => {{
+        const tab = btn.dataset.tab;
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+        document.querySelectorAll('section[data-tab]').forEach(s => s.classList.toggle('active', s.dataset.tab === tab));
+      }});
+    }});
+    // ─── 市场状态覆盖下拉同步（仪表盘 ↔ 选股执行） ───
+    const moMain = document.getElementById('marketOverride');
+    const moDash = document.getElementById('marketOverrideDash');
+    if (moMain && moDash) {{
+      moMain.addEventListener('change', () => {{ moDash.value = moMain.value; }});
+      moDash.addEventListener('change', () => {{ moMain.value = moDash.value; }});
+    }}
     const buttons = Array.from(document.querySelectorAll('button[data-action]'));
     const saveAmvButton = document.getElementById('saveAmv');
     const showTdxTop10Button = document.getElementById('showTdxTop10');
@@ -1199,17 +1272,26 @@ def _html_page() -> str:
       }}
       if (data.value) document.getElementById('amvInput').value = data.value;
       const regimeEl = document.getElementById('marketRegimeDisplay');
+      const dashRegimeEl = document.getElementById('amvRegime');
       if (data.market_regime) {{
-        regimeEl.textContent = '系统评估：' + data.market_regime + '（仓位上限 ' + data.max_position_pct + '%）';
+        const regimeText = data.market_regime + '（' + data.max_position_pct + '%仓位）';
         const regimeColors = {{
           '多头': '#15803d', '震荡偏强': '#355cff', '震荡中性': '#6b7280',
           '震荡偏弱': '#b45309', '空头': '#b91c1c'
         }};
-        regimeEl.style.color = regimeColors[data.market_regime] || '#355cff';
+        const regimeColor = regimeColors[data.market_regime] || '#355cff';
+        regimeEl.textContent = '系统评估：' + regimeText;
+        regimeEl.style.color = regimeColor;
         regimeEl.title = data.market_reason || '';
+        if (dashRegimeEl) {{
+          dashRegimeEl.textContent = regimeText;
+          dashRegimeEl.style.color = regimeColor;
+          dashRegimeEl.title = data.market_reason || '';
+        }}
       }} else {{
         regimeEl.textContent = '系统评估：不可用';
         regimeEl.style.color = '#6b7280';
+        if (dashRegimeEl) {{ dashRegimeEl.textContent = '不可用'; dashRegimeEl.style.color = '#6b7280'; }}
       }}
     }}
     async function saveActiveMarketValue() {{
@@ -1302,17 +1384,34 @@ def _html_page() -> str:
       const items = data.items || [];
       const riskColors = {{0: '#4caf50', 1: '#8bc34a', 2: '#ff9800', 3: '#ff5722', 4: '#f44336', 5: '#b71c1c'}};
       const opinionColors = {{'建议关注': '#4caf50', '谨慎': '#ff9800', '排除': '#f44336'}};
-      const reviewCards = items.filter(it => it.opinion || it.issues.length > 0 || it.highlights.length > 0).map(it => {{
+      const reviewItems = items.filter(it => it.opinion || it.issues.length > 0 || it.highlights.length > 0);
+      const reviewCards = reviewItems.map(it => {{
         const opinionTag = it.opinion ? '<span class="risk-badge" style="background:' + (opinionColors[it.opinion] || '#999') + ';">' + it.opinion + '</span>' : '';
         const riskTag = it.risk_level > 0 ? '<span class="risk-badge" style="background:' + (riskColors[it.risk_level] || '#999') + ';">风险' + it.risk_level + '</span>' : '';
         const rrTag = it.risk_reward > 0 ? '<span style="font-size:11px;color:#667085;">R/R=' + it.risk_reward + '</span>' : '';
-        const highlights = it.highlights.length > 0 ? '<div>' + it.highlights.map(h => '<span class="highlight-text">★ ' + h + '</span>').join('<br>') + '</div>' : '';
-        const issues = it.issues.length > 0 ? '<div>' + it.issues.map(i => '<span class="issue-text">- ' + i + '</span>').join('<br>') + '</div>' : '';
-        const posSug = it.position_suggestion ? '<div style="margin-top:4px;color:#355cff;font-size:12px;">仓位：' + it.position_suggestion + '</div>' : '';
-        const brief = it.brief ? '<div class="review-brief">' + it.brief + '</div>' : '';
-        return '<div class="agent-review-card"><div class="review-header"><strong>' + it.symbol + ' ' + it.name + '</strong>' + opinionTag + riskTag + rrTag + '</div>' + brief + highlights + issues + posSug + '</div>';
+        const detailParts = [];
+        if (it.brief) detailParts.push('<div class="review-brief">' + it.brief + '</div>');
+        if (it.highlights.length > 0) detailParts.push('<div>' + it.highlights.map(h => '<span class="highlight-text">★ ' + h + '</span>').join('<br>') + '</div>');
+        if (it.issues.length > 0) detailParts.push('<div>' + it.issues.map(i => '<span class="issue-text">- ' + i + '</span>').join('<br>') + '</div>');
+        if (it.position_suggestion) detailParts.push('<div style="margin-top:4px;color:#355cff;font-size:12px;">仓位：' + it.position_suggestion + '</div>');
+        const detail = detailParts.length > 0 ? '<div class="card-detail">' + detailParts.join('') + '</div>' : '';
+        return '<div class="agent-review-card"><div class="review-header"><strong>' + it.symbol + ' ' + it.name + '</strong>' + opinionTag + riskTag + rrTag + '<span class="toggle-icon"></span></div>' + detail + '</div>';
       }}).join('');
       listEl.innerHTML = reviewCards || '<div style="color:#667085;font-size:13px;">暂无逐只审核数据。</div>';
+      // 显示展开/收起控制栏
+      const toggleBar = document.getElementById('agentToggleBar');
+      toggleBar.style.display = reviewItems.length > 0 ? 'flex' : 'none';
+      // 卡片点击展开/收起
+      listEl.querySelectorAll('.agent-review-card').forEach(card => {{
+        card.addEventListener('click', () => card.classList.toggle('expanded'));
+      }});
+      // 展开/收起全部
+      document.getElementById('expandAllReviews').onclick = () => {{
+        listEl.querySelectorAll('.agent-review-card').forEach(c => c.classList.add('expanded'));
+      }};
+      document.getElementById('collapseAllReviews').onclick = () => {{
+        listEl.querySelectorAll('.agent-review-card').forEach(c => c.classList.remove('expanded'));
+      }};
     }}
     async function loadCandidateList() {{
       const list = document.getElementById('candidateList');
@@ -1374,6 +1473,8 @@ def _html_page() -> str:
       document.getElementById('detailLines').textContent = data.latest.white + ' / ' + data.latest.yellow;
       document.getElementById('detailMacd').textContent = data.latest.dif + ' / ' + data.latest.dea;
       document.getElementById('detailBrick').textContent = data.latest.brick;
+      const vol = data.latest.volume || 0;
+      document.getElementById('detailVolume').textContent = vol >= 10000 ? (vol / 10000).toFixed(1) + '万手' : vol + '手';
       document.getElementById('detailRange').textContent = data.support + ' / ' + data.resistance;
       document.getElementById('candidateReason').textContent = '标签：' + (data.tags || '无') + '。原因：' + (data.candidate_reason || '无');
       document.getElementById('candidateChart').innerHTML = drawCandidateChart(data);
@@ -1405,8 +1506,8 @@ def _html_page() -> str:
     function drawCandidateChart(data) {{
       const records = data.records || [];
       if (!records.length) return '<div class="hint">无可绘制数据。</div>';
-      const w = 980, priceH = 340, macdH = 135, brickH = 120, left = 54, right = 24, top = 24, gap = 34;
-      const totalH = top + priceH + gap + macdH + gap + brickH + 34;
+      const w = 980, priceH = 340, volH = 80, macdH = 135, brickH = 180, left = 54, right = 24, top = 24, gap = 34;
+      const totalH = top + priceH + gap + volH + gap + macdH + gap + brickH + 34;
       const innerW = w - left - right;
       const step = innerW / Math.max(records.length, 1);
       const priceValues = [];
@@ -1419,10 +1520,13 @@ def _html_page() -> str:
       const macdVals = [];
       records.forEach(r => macdVals.push(r.hist, r.dif, r.dea));
       const maxAbs = Math.max(0.01, ...macdVals.map(v => Math.abs(v)));
+      const volMax = Math.max(1, ...records.map(r => r.volume || 0));
       const brickMax = Math.max(1, ...records.map(r => r.brick || 0));
       function x(i) {{ return left + i * step + step / 2; }}
       function priceY(v) {{ return top + (pMax - v) / (pMax - pMin) * priceH; }}
-      const macdTop = top + priceH + gap;
+      const volTop = top + priceH + gap;
+      function volY(v) {{ return volTop + volH - (v / volMax) * (volH - 10); }}
+      const macdTop = volTop + volH + gap;
       function macdY(v) {{ return macdTop + macdH / 2 - v / maxAbs * (macdH / 2 - 12); }}
       const brickTop = macdTop + macdH + gap;
       function brickY(v) {{ return brickTop + brickH - (v / brickMax) * (brickH - 14); }}
@@ -1445,6 +1549,15 @@ def _html_page() -> str:
         const color = r.hist >= 0 ? '#d92d20' : '#039855';
         const bw = Math.max(3, Math.min(9, step * 0.5));
         return '<rect x="' + (cx - bw / 2) + '" y="' + Math.min(y, zero) + '" width="' + bw + '" height="' + Math.max(1, Math.abs(zero - y)) + '" fill="' + color + '" opacity="0.65"/>';
+      }}).join('');
+      const volBars = records.map((r, i) => {{
+        const cx = x(i), vol = r.volume || 0;
+        if (vol <= 0) return '';
+        const up = r.close >= r.open;
+        const color = up ? '#d92d20' : '#039855';
+        const bw = Math.max(3, Math.min(10, step * 0.56));
+        const yTop = volY(vol);
+        return '<rect x="' + (cx - bw / 2) + '" y="' + yTop + '" width="' + bw + '" height="' + (volTop + volH - yTop) + '" fill="' + color + '" opacity="0.5"/>';
       }}).join('');
       const brickGrid = [0.25, 0.5, 0.75].map(pos => {{
         const gy = brickTop + brickH * pos;
@@ -1481,6 +1594,11 @@ def _html_page() -> str:
         + '<text x="' + (w - right - 74) + '" y="' + (resistanceY - 5) + '" font-size="12" fill="#d92d20">压力 ' + data.resistance + '</text>'
         + '<text x="' + (left + 10) + '" y="' + (top + 18) + '" font-size="12" fill="#344054">白线</text>'
         + '<text x="' + (left + 56) + '" y="' + (top + 18) + '" font-size="12" fill="#f79009">黄线</text>'
+        + '<rect x="' + left + '" y="' + volTop + '" width="' + innerW + '" height="' + volH + '" fill="#f8fafc"/>'
+        + '<line x1="' + left + '" y1="' + volTop + '" x2="' + (w - right) + '" y2="' + volTop + '" stroke="#d0d5dd"/>'
+        + '<line x1="' + left + '" y1="' + (volTop + volH) + '" x2="' + (w - right) + '" y2="' + (volTop + volH) + '" stroke="#d0d5dd"/>'
+        + '<text x="' + left + '" y="' + (volTop + 14) + '" font-size="12" fill="#667085">成交量</text>'
+        + volBars
         + '<line x1="' + left + '" y1="' + macdY(0) + '" x2="' + (w - right) + '" y2="' + macdY(0) + '" stroke="#d0d5dd"/>'
         + '<text x="' + left + '" y="' + (macdTop - 8) + '" font-size="12" fill="#667085">MACD：柱体 + DIF/DEA</text>'
         + histBars
@@ -1600,6 +1718,7 @@ def _html_page() -> str:
 
     // ─── 持仓管理 ───
     let currentSellId = null;
+    let holdingsData = [];
     async function checkHoldings() {{
       const btn = document.getElementById('btnCheckHoldings');
       btn.disabled = true; btn.textContent = '正在检查持仓...';
@@ -1618,6 +1737,7 @@ def _html_page() -> str:
     }}
     function renderHoldings(holdings) {{
       const el = document.getElementById('holdingsTable');
+      holdingsData = holdings;
       if (!holdings.length) {{ el.innerHTML = '<div style="color:var(--muted);">暂无持仓记录。点击"添加持仓"按钮录入。</div>'; return; }}
       let html = '<table style="width:100%;border-collapse:collapse;font-size:13px;"><thead><tr style="background:var(--bg);">';
       html += '<th style="padding:6px;border:1px solid var(--rule);">代码</th>';
@@ -1633,7 +1753,7 @@ def _html_page() -> str:
       html += '<th style="padding:6px;border:1px solid var(--rule);">卖出信号</th>';
       html += '<th style="padding:6px;border:1px solid var(--rule);">操作</th>';
       html += '</tr></thead><tbody>';
-      holdings.forEach(h => {{
+      holdings.forEach((h, idx) => {{
         const pnlColor = h.pnl >= 0 ? 'var(--success)' : 'var(--danger)';
         const signals = (h.signals || []).map(s => '<span style="background:' + (s.priority <= 1 ? '#fde8e8' : s.priority === 2 ? '#fff3e0' : '#e3f2fd') + ';color:' + (s.priority <= 1 ? 'var(--danger)' : s.priority === 2 ? '#e65100' : '#1565c0') + ';padding:2px 6px;border-radius:4px;font-size:11px;margin:1px;display:inline-block;">' + s.rule + '</span>').join('');
         const errNote = h.error ? '<span style="color:var(--danger);font-size:11px;">' + h.error + '</span>' : '';
@@ -1649,7 +1769,7 @@ def _html_page() -> str:
         html += '<td style="padding:6px;border:1px solid var(--rule);color:' + pnlColor + ';">' + (h.pnl_pct != null ? h.pnl_pct.toFixed(2) + '%' : '—') + '</td>';
         html += '<td style="padding:6px;border:1px solid var(--rule);">' + (h.rr != null ? h.rr : '—') + '</td>';
         html += '<td style="padding:6px;border:1px solid var(--rule);">' + (signals || errNote || '—') + '</td>';
-        html += '<td style="padding:6px;border:1px solid var(--rule);"><button onclick="showSellModal(' + h.id + ',' + (h.shares || 0) + ',\'' + (h.symbol || '') + '\',\'' + (h.name || '') + '\',\'' + (h.buy_price || 0) + '\')" style="padding:3px 8px;font-size:11px;">卖出</button> <button onclick="deleteHolding(' + h.id + ')" style="padding:3px 8px;font-size:11px;color:var(--danger);">删除</button></td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);"><button onclick="showSellModal(' + idx + ')" style="padding:3px 8px;font-size:11px;">卖出</button> <button onclick="deleteHolding(' + h.id + ')" style="padding:3px 8px;font-size:11px;color:var(--danger);">删除</button></td>';
         html += '</tr>';
       }});
       html += '</tbody></table>';
@@ -1676,11 +1796,13 @@ def _html_page() -> str:
       if (data.ok) {{ alert('添加成功'); document.getElementById('addHoldingForm').style.display = 'none'; checkHoldings(); }}
       else {{ alert('添加失败：' + data.error); }}
     }}
-    function showSellModal(id, shares, symbol, name, buyPrice) {{
-      currentSellId = id;
-      document.getElementById('sellInfo').textContent = symbol + ' ' + name + ' | 持仓 ' + shares + ' 股 | 买入价 ' + buyPrice;
+    function showSellModal(idx) {{
+      const h = holdingsData[idx];
+      if (!h) return;
+      currentSellId = h.id;
+      document.getElementById('sellInfo').textContent = h.symbol + ' ' + (h.name || '') + ' | 持仓 ' + h.shares + ' 股 | 买入价 ' + h.buy_price;
       document.getElementById('sellDate').value = new Date().toISOString().slice(0, 10);
-      document.getElementById('sellShares').value = shares;
+      document.getElementById('sellShares').value = h.shares;
       document.getElementById('sellPrice').value = '';
       document.getElementById('sellModal').style.display = 'flex';
     }}
@@ -1784,14 +1906,14 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             target_date = parse_qs(parsed.query).get("date", [""])[0]
             if not target_date:
-                target_date = date.today().isoformat()
+                target_date = _last_trading_day().isoformat()
             self._send_json(_db_candidates(target_date))
             return
         if self.path.startswith("/db-reviews"):
             parsed = urlparse(self.path)
             target_date = parse_qs(parsed.query).get("date", [""])[0]
             if not target_date:
-                target_date = date.today().isoformat()
+                target_date = _last_trading_day().isoformat()
             self._send_json(_db_reviews(target_date))
             return
         if self.path.startswith("/db-symbol-history"):

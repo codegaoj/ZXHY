@@ -26,6 +26,7 @@ from trading_system.chart_quality import evaluate_chart_quality
 from trading_system.agent_review import review_candidates
 from trading_system.sector_analyzer import build_sector_mapping, fetch_sector_performance, get_sector_info, sector_strength_score
 from trading_system.storage import Storage
+from trading_system.trade_calendar import last_trading_day
 
 
 DEFAULT_ACTIVE_MARKET_VALUE_PCT = 4.82
@@ -33,6 +34,8 @@ HISTORY_DAYS = 180
 PREFILTER_LIMIT = 220
 MAX_WORKERS = 10
 TOP_N = 40
+
+_process_errors: list[str] = []
 
 
 def load_active_market_value_pct() -> float:
@@ -111,7 +114,7 @@ def to_float(value, default=0.0) -> float:
 
 def load_spot() -> pd.DataFrame:
     cache_path = PROJECT_ROOT / "data" / "a_spot_latest.csv"
-    today = date.today()
+    today = last_trading_day()
     cache_is_today = False
     if cache_path.exists():
         mtime = datetime.fromtimestamp(cache_path.stat().st_mtime).date()
@@ -480,6 +483,7 @@ def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: s
     try:
         daily = fetch_daily(symbol, start_date, end_date)
         if daily is None or daily.empty or len(daily) < 60:
+            _process_errors.append(f"{symbol} {name}: 日线数据不足（{len(daily) if daily is not None else 0}条）")
             return None
         snapshot = build_snapshot(WatchSymbol(symbol=symbol, name=name, tags=[]), daily, active_market_value_pct, recent_values)
         plan = engine.build_plan(snapshot, market_override=market_override)
@@ -494,8 +498,7 @@ def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: s
         candidate_score += sector_bonus
         if sector_info:
             candidate_reason += f"；板块{sector_info.strength}({sector_info.sector_name}+{sector_info.sector_change}%)"
-        min_threshold = 30 if market_regime in ("neutral_weak", "bear") else 25
-        if candidate_score < min_threshold:
+        if candidate_score < 30:
             return None
         return {
             "symbol": symbol,
@@ -525,7 +528,8 @@ def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: s
             "sector_strength": sector_info.strength if sector_info else "未知",
             "sector_change": round(sector_info.sector_change, 2) if sector_info else 0.0,
         }
-    except Exception:
+    except Exception as e:
+        _process_errors.append(f"{symbol} {name}: {type(e).__name__}: {e}")
         return None
 
 
@@ -675,7 +679,7 @@ def main():
     config_path = save_config()
     pre = prefilter_for_history(pool, market_regime=market_regime)
 
-    end = date.today()
+    end = last_trading_day()
     start = end - timedelta(days=HISTORY_DAYS + 30)
     start_date = start.strftime("%Y%m%d")
     end_date = end.strftime("%Y%m%d")
@@ -687,6 +691,7 @@ def main():
     print(f"板块映射: {len(sector_mapping)} 只股票, 行业表现: {len(sector_performance)} 个板块")
 
     rows = []
+    _process_errors.clear()
     records = pre.to_dict("records")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_one, row, engine, start_date, end_date, active_market_value_pct, recent_values, sector_mapping, sector_performance, market_regime, args.market_override) for row in records]
@@ -696,6 +701,18 @@ def main():
                 rows.append(result)
             if idx % 50 == 0:
                 print(f"已计算 {idx}/{len(records)}，候选 {len(rows)}")
+
+    error_count = len(_process_errors)
+    low_score_count = len(records) - len(rows) - error_count
+    print(f"[统计] 预筛选 {len(records)} 只 → 通过 {len(rows)} 只，分数不足 {low_score_count} 只，处理错误 {error_count} 只")
+    if _process_errors:
+        print(f"[错误详情] 前10条：")
+        for err in _process_errors[:10]:
+            print(f"  - {err}")
+        if len(_process_errors) > 10:
+            print(f"  ... 还有 {len(_process_errors) - 10} 条错误")
+        if error_count == len(records):
+            print("[警告] 全部股票处理失败！请检查 AkShare 数据源是否可用（网络/限流）。")
 
     rows = sorted(rows, key=lambda item: item["candidate_score"], reverse=True)[:TOP_N]
     stats = {
@@ -708,6 +725,8 @@ def main():
         "market_regime": market_state.regime.value,
         "market_reason": market_state.reason,
         "manual_override": market_state.manual_override,
+        "process_errors": error_count,
+        "low_score_skips": low_score_count,
     }
 
     daily_csv = outputs / "daily_candidates.csv"
@@ -715,7 +734,7 @@ def main():
     daily_json = outputs / "daily_candidates.json"
     write_csv(rows, daily_csv)
     write_html(rows, stats, daily_html, active_market_value_pct, market_regime=market_state.regime.value, market_reason=market_state.reason)
-    today_str = date.today().isoformat()
+    today_str = last_trading_day().isoformat()
     daily_json.write_text(json.dumps({"date": today_str, "market_regime": market_state.regime.value, "market_reason": market_state.reason, "manual_override": market_state.manual_override, "stats": stats, "candidates": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 保存带日期的历史备份到 history/ 目录（CSV + JSON + HTML）

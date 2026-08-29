@@ -17,6 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 import akshare as ak  # type: ignore
 
 from trading_system.storage import Storage
+from trading_system.trade_calendar import last_trading_day
 
 HISTORY_DAYS = 15
 # AkShare 的部分日线接口会调用 py_mini_racer，Windows 下并发调用偶发底层崩溃。
@@ -65,7 +66,7 @@ def load_candidates() -> tuple[list[dict], str]:
     返回 (candidates, source_date)。
     """
     outputs = PROJECT_ROOT / "outputs"
-    today = date.today()
+    today = last_trading_day()
     today_str = today.isoformat()
 
     # 1. 优先扫描 outputs/history/ 目录下的带日期历史备份
@@ -132,7 +133,7 @@ def fetch_spot_all() -> pd.DataFrame:
 
 def fetch_daily(symbol: str) -> pd.DataFrame:
     """获取个股历史日线（仅作为实时行情不可用时的回退）。"""
-    end = date.today()
+    end = last_trading_day()
     start = end - timedelta(days=HISTORY_DAYS + 20)
     start_date = start.strftime("%Y%m%d")
     end_date = end.strftime("%Y%m%d")
@@ -196,7 +197,7 @@ def process_one(candidate: dict, spot_df: pd.DataFrame | None = None) -> dict:
         if not spot_row.empty:
             sr = spot_row.iloc[0]
             latest = {
-                "date": str(date.today()),
+                "date": last_trading_day().isoformat(),
                 "open": to_float(sr.get("今开")),
                 "high": to_float(sr.get("最高")),
                 "low": to_float(sr.get("最低")),
@@ -535,7 +536,7 @@ def main() -> None:
 
     # ---- SQLite 持久化 ----
     try:
-        today_str = date.today().isoformat()
+        today_str = last_trading_day().isoformat()
         with Storage() as db:
             db.save_candidate_reviews(selected_date, today_str, rows)
             db.save_review_stats(today_str, selected_date, stats)

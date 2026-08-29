@@ -28,6 +28,8 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from trading_system.trade_calendar import last_trading_day
+
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -147,7 +149,10 @@ def retry(fn, times=3, pause=1.5):
 
 
 def fetch_latest_prices(symbols: set[str]) -> dict[str, dict]:
-    """批量获取最新行情，返回 {symbol: {close, date, high, low}}。"""
+    """批量获取最新行情，返回 {symbol: {close, date, high, low}}。
+
+    优先用实时行情，非交易日或实时数据为空时，从日K线取最新一根。
+    """
     try:
         import akshare as ak  # type: ignore
     except ImportError:
@@ -165,12 +170,36 @@ def fetch_latest_prices(symbols: set[str]) -> dict[str, dict]:
                     if code in symbols:
                         result[code] = {
                             "close": float(row.get("最新价", 0)),
-                            "date": date.today().isoformat(),
+                            "date": last_trading_day().isoformat(),
                             "high": float(row.get("最高", 0)),
                             "low": float(row.get("最低", 0)),
                         }
     except Exception:
         pass
+
+    # 方法2: 实时行情没取到的，从日K线最后一根补
+    missing = symbols - set(result.keys())
+    if missing:
+        print(f"[周期复盘] 实时行情缺 {len(missing)} 只，从日K线补取...")
+        for code in missing:
+            try:
+                kdf = fetch_daily_kline(code,
+                                        (last_trading_day() - timedelta(days=10)).isoformat(),
+                                        last_trading_day().isoformat())
+                if kdf is not None and len(kdf) > 0:
+                    last_row = kdf.iloc[-1]
+                    date_col = "日期" if "日期" in kdf.columns else kdf.columns[0]
+                    close_col = "收盘" if "收盘" in kdf.columns else "close"
+                    high_col = "最高" if "最高" in kdf.columns else "high"
+                    low_col = "最低" if "最低" in kdf.columns else "low"
+                    result[code] = {
+                        "close": float(last_row.get(close_col, 0)),
+                        "date": str(last_row.get(date_col, "")),
+                        "high": float(last_row.get(high_col, 0)),
+                        "low": float(last_row.get(low_col, 0)),
+                    }
+            except Exception:
+                continue
 
     return result
 
@@ -626,7 +655,7 @@ def main() -> None:
     parser.add_argument("--end", type=str, default="", help="自定义结束日期 YYYY-MM-DD")
     args = parser.parse_args()
 
-    today = date.today()
+    today = last_trading_day()
 
     if args.period == "weekly":
         start_date = today - timedelta(days=7)
@@ -681,26 +710,35 @@ def main() -> None:
         print("[周期复盘] 无有效记录，退出。")
         return
 
-    # 2. 获取最新行情
-    all_symbols = set(r.symbol for r in all_records)
-    print(f"[周期复盘] 获取 {len(all_symbols)} 只股票的最新行情...")
-
-    latest_prices = fetch_latest_prices(all_symbols)
-    print(f"[周期复盘] 获取到 {len(latest_prices)} 只股票的行情")
-
-    # 3. 获取K线计算持有期表现（串行，避免并发崩溃）
-    print("[周期复盘] 逐只获取K线计算持有期表现...")
+    # 2. 逐只获取K线，同时提取最新价并计算持有期表现（串行，避免并发崩溃）
+    print(f"[周期复盘] 逐只获取K线并计算表现（共 {len(all_records)} 条记录）...")
     perfs: list[PerformanceRecord] = []
+    kline_cache: dict[str, pd.DataFrame] = {}  # 同一只股票缓存K线，避免重复请求
     for i, record in enumerate(all_records):
         if (i + 1) % 10 == 0:
             print(f"  进度：{i + 1}/{len(all_records)}")
 
-        latest = latest_prices.get(record.symbol, {})
-        if not latest:
-            latest = {"close": 0, "date": "", "high": 0, "low": 0}
+        # 取完整K线（缓存复用）
+        if record.symbol in kline_cache:
+            kline_df = kline_cache[record.symbol]
+        else:
+            kline_df = fetch_daily_kline(record.symbol, record.selected_date, today.isoformat())
+            kline_cache[record.symbol] = kline_df
 
-        # 获取选入日到今天的K线
-        kline_df = fetch_daily(record.symbol, record.selected_date, today.isoformat())
+        # 从K线最后一根提取最新价
+        latest = {"close": 0, "date": "", "high": 0, "low": 0}
+        if kline_df is not None and len(kline_df) > 0:
+            last_row = kline_df.iloc[-1]
+            date_col = "日期" if "日期" in kline_df.columns else kline_df.columns[0]
+            close_col = "收盘" if "收盘" in kline_df.columns else "close"
+            high_col = "最高" if "最高" in kline_df.columns else "high"
+            low_col = "最低" if "最低" in kline_df.columns else "low"
+            latest = {
+                "close": float(last_row.get(close_col, 0)),
+                "date": str(last_row.get(date_col, "")),
+                "high": float(last_row.get(high_col, 0)),
+                "low": float(last_row.get(low_col, 0)),
+            }
 
         perf = compute_performance(record, latest, kline_df)
         perfs.append(perf)

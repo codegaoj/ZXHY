@@ -22,6 +22,7 @@ from trading_system.data_normalizer import WatchSymbol, build_snapshot
 from trading_system.engines import TradePlanEngine
 from trading_system.indicators import is_macd_bullish
 from trading_system.rulebook import Rulebook
+from trading_system.trade_calendar import last_trading_day
 
 
 ACTIVE_MARKET_VALUE_PCT = 4.82
@@ -457,7 +458,7 @@ def main():
     config_path = save_config()
     pre = prefilter_for_history(pool)
 
-    end = date.today()
+    end = last_trading_day()
     start = end - timedelta(days=HISTORY_DAYS + 30)
     start_date = start.strftime("%Y%m%d")
     end_date = end.strftime("%Y%m%d")
