@@ -88,6 +88,7 @@ def build_snapshot(
         name=symbol.name,
         close=round(close, 4),
         prev_close=round(float(prev["close"]), 4),
+        prev_low=round(float(prev["low"]), 4),
         volume=round(float(latest["volume"]), 4),
         volume_ma5=round(float(df["volume"].tail(5).mean()), 4),
         active_market_value_pct=round(float(active_market_value_pct), 4),

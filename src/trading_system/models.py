@@ -73,6 +73,7 @@ class SecuritySnapshot:
     name: str
     close: float
     prev_close: float
+    prev_low: float  # 前一日最低价（滴滴战法用）
     volume: float
     volume_ma5: float
     active_market_value_pct: float

@@ -107,11 +107,19 @@ COMMANDS = {
             "all",
         ],
     },
+    "simulation": {
+        "name": "运行模拟交易",
+        "cmd": [
+            sys.executable,
+            "tools/run_simulation.py",
+            "--run",
+        ],
+    },
 }
 
 DAILY_WORKFLOW = {
     "name": "每日一键执行",
-    "steps": ["refresh_spot", "review_candidates", "screen_candidates"],
+    "steps": ["refresh_spot", "review_candidates", "screen_candidates", "simulation"],
 }
 
 
@@ -666,7 +674,7 @@ def _run_action(action: str, market_override: str = None) -> None:
 
 
 def _run_daily_workflow(market_override: str = None) -> None:
-    """串行执行每日一键执行流程：刷新行情 → 复盘昨日候选股 → 生成今日候选股票。"""
+    """串行执行每日一键执行流程：刷新行情 → 复盘昨日候选股 → 生成今日候选股票 → 运行模拟交易。"""
     steps = DAILY_WORKFLOW["steps"]
     total = len(steps)
     with STATE_LOCK:
@@ -888,6 +896,146 @@ def _transactions_list(symbol: str = "") -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+# ─── 模拟交易辅助函数 ───
+
+SIM_DEFAULT_ACCOUNT_NAME = "验证账户-全买模式"
+
+
+def _sim_get_account() -> dict:
+    """获取模拟账户信息（含最新净值和绩效统计）。"""
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            account = db.get_sim_account_by_name(SIM_DEFAULT_ACCOUNT_NAME)
+            if not account:
+                return {"ok": False, "error": "模拟账户不存在，请先运行模拟交易初始化"}
+            # 获取最新净值
+            latest_nav = db.get_latest_sim_nav(account["id"])
+            # 获取持仓数
+            open_holdings = db.get_sim_open_holdings(account["id"])
+            # 计算胜率（已平仓交易）
+            all_holdings = db.get_sim_all_holdings(account["id"], limit=500)
+            closed = [h for h in all_holdings if h["status"] == "closed"]
+            wins = [h for h in closed if h["pnl"] and h["pnl"] > 0]
+            win_rate = round(len(wins) / len(closed) * 100, 1) if closed else 0.0
+
+            total_return_pct = 0.0
+            current_nav = account["initial_capital"]
+            if latest_nav:
+                total_return_pct = latest_nav.get("total_return_pct", 0.0)
+                current_nav = latest_nav.get("nav", account["initial_capital"])
+
+            return {
+                "ok": True,
+                "account": {
+                    "id": account["id"],
+                    "name": account["name"],
+                    "initial_capital": account["initial_capital"],
+                    "current_cash": account["current_cash"],
+                    "total_value": account["total_value"],
+                    "current_nav": round(current_nav, 2),
+                    "total_return_pct": round(total_return_pct, 2),
+                    "holding_count": len(open_holdings),
+                    "win_rate": win_rate,
+                    "closed_count": len(closed),
+                    "win_count": len(wins),
+                    "start_date": account.get("start_date", ""),
+                },
+            }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _sim_get_holdings() -> dict:
+    """获取模拟账户当前持仓。"""
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            account = db.get_sim_account_by_name(SIM_DEFAULT_ACCOUNT_NAME)
+            if not account:
+                return {"ok": False, "error": "模拟账户不存在"}
+            holdings = db.get_sim_open_holdings(account["id"])
+            return {"ok": True, "holdings": holdings}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _sim_get_nav_history() -> dict:
+    """获取模拟账户净值历史。"""
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            account = db.get_sim_account_by_name(SIM_DEFAULT_ACCOUNT_NAME)
+            if not account:
+                return {"ok": False, "error": "模拟账户不存在"}
+            history = db.get_sim_nav_history(account["id"], limit=500)
+            return {"ok": True, "history": history, "initial_capital": account["initial_capital"]}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _sim_get_transactions() -> dict:
+    """获取模拟账户交易记录。"""
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from trading_system.storage import Storage
+        with Storage() as db:
+            account = db.get_sim_account_by_name(SIM_DEFAULT_ACCOUNT_NAME)
+            if not account:
+                return {"ok": False, "error": "模拟账户不存在"}
+            transactions = db.get_sim_transactions(account["id"], limit=200)
+            return {"ok": True, "transactions": transactions}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _sim_run() -> dict:
+    """运行今日模拟交易（异步执行，返回任务状态）。"""
+    with STATE_LOCK:
+        if STATE["running"]:
+            return {"ok": False, "error": "已有任务正在运行，请等待完成"}
+    threading.Thread(target=_run_simulation_task, daemon=True).start()
+    return {"ok": True, "message": "模拟交易已启动"}
+
+
+def _run_simulation_task() -> None:
+    """后台执行模拟交易任务。"""
+    with STATE_LOCK:
+        STATE["running"] = True
+        STATE["action"] = "模拟交易"
+        STATE["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        STATE["finished_at"] = ""
+        STATE["exit_code"] = None
+        STATE["log"] = ["[模拟交易] 开始执行..."]
+
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from tools.run_simulation import run_simulation
+        result = run_simulation()
+        with STATE_LOCK:
+            STATE["log"].append(f"[模拟交易] 执行完成")
+            if result.get("nav"):
+                STATE["log"].append(f"  净值日期：{result['nav'].get('date', '-')}")
+                STATE["log"].append(f"  当前净值：{result['nav'].get('nav', '-')}")
+                STATE["log"].append(f"  累计收益：{result['nav'].get('total_return_pct', '-')}%")
+            if result.get("performance"):
+                perf = result["performance"]
+                STATE["log"].append(f"  总交易次数：{perf.get('total_trades', '-')}")
+                STATE["log"].append(f"  胜率：{perf.get('win_rate', '-')}%")
+            STATE["exit_code"] = 0
+    except Exception as exc:
+        with STATE_LOCK:
+            STATE["log"].append(f"[模拟交易] 执行失败：{exc}")
+            STATE["exit_code"] = 1
+    finally:
+        with STATE_LOCK:
+            STATE["running"] = False
+            STATE["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _html_page() -> str:
     links = "\n".join(
         f'<a class="report-link" href="/view/{path}" target="_blank"><span>{name}</span><small>{path}</small></a>'
@@ -1046,6 +1194,7 @@ def _html_page() -> str:
       <button class="tab-btn active" data-tab="dashboard">仪表盘</button>
       <button class="tab-btn" data-tab="screening">选股执行</button>
       <button class="tab-btn" data-tab="holdings">持仓管理</button>
+      <button class="tab-btn" data-tab="simulation">模拟交易</button>
       <button class="tab-btn" data-tab="reports">报告与历史</button>
       <button class="tab-btn" data-tab="log">运行日志</button>
     </nav>
@@ -1106,9 +1255,9 @@ def _html_page() -> str:
         <button data-action="periodic_review_all"><strong>全部历史复盘</strong><span>汇总所有历史选入记录，全面评估策略表现</span></button>
       </div>
       <div style="margin-top:14px;">
-        <button class="primary-button" id="runDailyWorkflow" type="button" style="background:#e65100;font-size:16px;padding:12px 24px;"><strong>⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选）</strong></button>
+        <button class="primary-button" id="runDailyWorkflow" type="button" style="background:#e65100;font-size:16px;padding:12px 24px;"><strong>⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选→模拟交易）</strong></button>
       </div>
-      <div class="hint">执行顺序：先刷新实时行情，再复盘昨日候选股（用今天行情对比昨天选入价），最后生成今天的候选股。首次使用无历史备份时复盘会跳过，第二天起正常工作。</div>
+      <div class="hint">执行顺序：刷新实时行情 → 复盘昨日候选股 → 生成今日候选股票 → 运行模拟交易。首次使用无历史备份时复盘会跳过，第二天起正常工作。</div>
     </section>
 
     <section data-tab="reports">
@@ -1216,6 +1365,44 @@ def _html_page() -> str:
             <button onclick="confirmSell()">确认卖出</button>
             <button onclick="document.getElementById('sellModal').style.display='none'">取消</button>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <section data-tab="simulation">
+      <h2>模拟交易</h2>
+      <p>自动跟踪每日选股结果，全量买入验证选股系统质量。每只票固定仓位，按风控规则自动卖出。</p>
+      <div class="status">
+        <div class="stat"><span>账户名称</span><strong id="simAccountName">-</strong></div>
+        <div class="stat"><span>初始资金</span><strong id="simInitialCapital">-</strong></div>
+        <div class="stat"><span>当前净值</span><strong id="simCurrentNav">-</strong></div>
+        <div class="stat"><span>累计收益</span><strong id="simTotalReturn">-</strong></div>
+        <div class="stat"><span>持仓数量</span><strong id="simHoldingCount">-</strong></div>
+        <div class="stat"><span>胜率</span><strong id="simWinRate">-</strong></div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <button class="primary-button" id="runSimulationBtn" type="button" onclick="runSimulation()"><strong>运行今日模拟交易</strong></button>
+        <button class="primary-button" id="refreshSimBtn" type="button" onclick="loadSimulationData()"><strong>刷新数据</strong></button>
+        <span class="hint" id="simStatusHint">点击"刷新数据"查看模拟账户状态</span>
+      </div>
+      <div class="grid2" style="margin-top:14px;display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+        <div>
+          <h3>当前持仓</h3>
+          <div id="simHoldingsTable" class="chart-card" style="min-height:300px;overflow-x:auto;">
+            <div class="hint">暂无数据</div>
+          </div>
+        </div>
+        <div>
+          <h3>净值曲线</h3>
+          <div id="simNavChart" class="chart-card" style="min-height:300px;">
+            <div class="hint">暂无数据</div>
+          </div>
+        </div>
+      </div>
+      <div style="margin-top:14px;">
+        <h3>交易记录</h3>
+        <div id="simTransactionsTable" class="chart-card" style="min-height:200px;overflow-x:auto;">
+          <div class="hint">暂无数据</div>
         </div>
       </div>
     </section>
@@ -1629,7 +1816,7 @@ def _html_page() -> str:
       if (data.running) {{
         runDailyWorkflowButton.textContent = '⏳ ' + (data.action || '执行中...');
       }} else {{
-        runDailyWorkflowButton.textContent = '⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选）';
+        runDailyWorkflowButton.textContent = '⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选→模拟交易）';
       }}
     }}
     buttons.forEach(btn => btn.addEventListener('click', () => runAction(btn.dataset.action)));
@@ -1700,7 +1887,7 @@ def _html_page() -> str:
             if (!data.ok) {{
                 alert(data.error || '启动失败');
                 runDailyWorkflowButton.disabled = false;
-                runDailyWorkflowButton.textContent = '⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选）';
+                runDailyWorkflowButton.textContent = '⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选→模拟交易）';
             }} else {{
                 appendLog(`每日一键执行已触发：${{data.message || 'ok'}}`);
                 refreshStatus();
@@ -1708,7 +1895,7 @@ def _html_page() -> str:
         }} catch(e) {{
             appendLog('每日一键执行请求失败：' + e.message);
             runDailyWorkflowButton.disabled = false;
-            runDailyWorkflowButton.textContent = '⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选）';
+            runDailyWorkflowButton.textContent = '⚡ 每日一键执行（刷新行情→复盘昨日→生成今日候选→模拟交易）';
         }}
     }});
     refreshActiveMarketValue();
@@ -1860,6 +2047,227 @@ def _html_page() -> str:
       html += '</tbody></table>';
       el.innerHTML = html;
     }}
+
+    // ─── 模拟交易 ───
+    async function loadSimulationData() {{
+      const hint = document.getElementById('simStatusHint');
+      if (hint) hint.textContent = '加载中...';
+
+      // 并行加载所有数据
+      const [accountRes, holdingsRes, navRes, txnsRes] = await Promise.all([
+        fetch('/simulation/account'),
+        fetch('/simulation/holdings'),
+        fetch('/simulation/nav-history'),
+        fetch('/simulation/transactions'),
+      ]);
+
+      const accountData = await accountRes.json();
+      const holdingsData = await holdingsRes.json();
+      const navData = await navRes.json();
+      const txnsData = await txnsRes.json();
+
+      // 更新账户状态
+      if (accountData.ok && accountData.account) {{
+        const a = accountData.account;
+        document.getElementById('simAccountName').textContent = a.name || '-';
+        document.getElementById('simInitialCapital').textContent = a.initial_capital ? a.initial_capital.toLocaleString('zh-CN', {{minimumFractionDigits: 2}}) + ' 元' : '-';
+        document.getElementById('simCurrentNav').textContent = a.current_nav ? a.current_nav.toLocaleString('zh-CN', {{minimumFractionDigits: 2}}) + ' 元' : '-';
+        const retEl = document.getElementById('simTotalReturn');
+        const retPct = a.total_return_pct || 0;
+        retEl.textContent = retPct.toFixed(2) + '%';
+        retEl.style.color = retPct >= 0 ? 'var(--success)' : 'var(--danger)';
+        document.getElementById('simHoldingCount').textContent = a.holding_count != null ? a.holding_count + ' 只' : '-';
+        document.getElementById('simWinRate').textContent = a.win_rate != null ? a.win_rate + '% (' + (a.win_count || 0) + '/' + (a.closed_count || 0) + ')' : '-';
+        if (hint) hint.textContent = '数据已更新';
+      }} else {{
+        if (hint) hint.textContent = '账户未初始化：' + (accountData.error || '未知错误');
+      }}
+
+      // 渲染持仓
+      renderSimHoldings(holdingsData);
+
+      // 渲染净值曲线
+      renderSimNavChart(navData);
+
+      // 渲染交易记录
+      renderSimTransactions(txnsData);
+    }}
+
+    function renderSimHoldings(data) {{
+      const el = document.getElementById('simHoldingsTable');
+      if (!el) return;
+      if (!data.ok) {{ el.innerHTML = '<div style="color:var(--danger);">错误：' + data.error + '</div>'; return; }}
+      const holdings = data.holdings || [];
+      if (!holdings.length) {{ el.innerHTML = '<div style="color:var(--muted);padding:20px;text-align:center;">暂无持仓</div>'; return; }}
+      let html = '<table style="width:100%;border-collapse:collapse;font-size:13px;"><thead><tr style="background:var(--bg);">';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">代码</th><th style="padding:6px;border:1px solid var(--rule);">名称</th><th style="padding:6px;border:1px solid var(--rule);">买入日期</th><th style="padding:6px;border:1px solid var(--rule);">买入价</th><th style="padding:6px;border:1px solid var(--rule);">现价</th><th style="padding:6px;border:1px solid var(--rule);">股数</th><th style="padding:6px;border:1px solid var(--rule);">盈亏</th><th style="padding:6px;border:1px solid var(--rule);">盈亏%</th>';
+      html += '</tr></thead><tbody>';
+      holdings.forEach(h => {{
+        const pnl = h.pnl || 0;
+        const pnlPct = h.pnl_pct || 0;
+        const pnlColor = pnl >= 0 ? 'var(--success)' : 'var(--danger)';
+        html += '<tr>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + h.symbol + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (h.name || '') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + h.buy_date + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + h.buy_price.toFixed(2) + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (h.current_price ? h.current_price.toFixed(2) : '—') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + h.shares + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);color:' + pnlColor + ';">' + pnl.toFixed(2) + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);color:' + pnlColor + ';">' + pnlPct.toFixed(2) + '%</td>';
+        html += '</tr>';
+      }});
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    }}
+
+    function renderSimNavChart(data) {{
+      const el = document.getElementById('simNavChart');
+      if (!el) return;
+      if (!data.ok) {{ el.innerHTML = '<div style="color:var(--danger);">错误：' + data.error + '</div>'; return; }}
+      const history = data.history || [];
+      const initialCapital = data.initial_capital || 100000;
+      if (!history.length) {{ el.innerHTML = '<div style="color:var(--muted);padding:20px;text-align:center;">暂无净值数据</div>'; return; }}
+
+      // 计算图表尺寸
+      const width = 480;
+      const height = 260;
+      const padding = {{ top: 20, right: 20, bottom: 30, left: 60 }};
+      const chartW = width - padding.left - padding.right;
+      const chartH = height - padding.top - padding.bottom;
+
+      // 找净值范围
+      let minNav = Infinity, maxNav = -Infinity;
+      history.forEach(h => {{ if (h.nav < minNav) minNav = h.nav; if (h.nav > maxNav) maxNav = h.nav; }});
+      // 以初始资金为基准线，上下留空间
+      const baseLine = initialCapital;
+      const range = Math.max(maxNav - baseLine, baseLine - minNav);
+      const paddingRange = range * 0.2 + initialCapital * 0.01;
+      const yMax = baseLine + paddingRange;
+      const yMin = baseLine - paddingRange;
+      const yRange = yMax - yMin;
+
+      // 生成路径点
+      const points = history.map((h, i) => {{
+        const x = padding.left + (i / (history.length - 1 || 1)) * chartW;
+        const y = padding.top + (1 - (h.nav - yMin) / yRange) * chartH;
+        return {{ x, y, nav: h.nav, date: h.date }};
+      }});
+
+      // 构建SVG路径
+      let pathD = 'M ' + points[0].x + ' ' + points[0].y;
+      for (let i = 1; i < points.length; i++) {{
+        pathD += ' L ' + points[i].x + ' ' + points[i].y;
+      }}
+
+      // 基准线（初始资金）
+      const baseY = padding.top + (1 - (baseLine - yMin) / yRange) * chartH;
+
+      // 填充区域路径
+      let areaD = pathD + ' L ' + points[points.length - 1].x + ' ' + (padding.top + chartH);
+      areaD += ' L ' + points[0].x + ' ' + (padding.top + chartH) + ' Z';
+
+      // 判断整体盈亏颜色
+      const latestNav = history[history.length - 1].nav;
+      const isProfit = latestNav >= baseLine;
+      const lineColor = isProfit ? '#178a54' : '#b9382f';
+      const areaColor = isProfit ? 'rgba(23, 138, 84, 0.12)' : 'rgba(185, 56, 47, 0.12)';
+
+      let svg = '<svg width="100%" height="100%" viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="xMidYMid meet">';
+
+      // Y轴刻度
+      for (let i = 0; i <= 4; i++) {{
+        const y = padding.top + (i / 4) * chartH;
+        const value = yMax - (i / 4) * yRange;
+        svg += '<line x1="' + padding.left + '" y1="' + y + '" x2="' + (width - padding.right) + '" y2="' + y + '" stroke="#eee" stroke-width="1"/>';
+        svg += '<text x="' + (padding.left - 6) + '" y="' + (y + 4) + '" text-anchor="end" fill="#999" font-size="11">' + value.toFixed(0) + '</text>';
+      }}
+
+      // 基准线
+      svg += '<line x1="' + padding.left + '" y1="' + baseY + '" x2="' + (width - padding.right) + '" y2="' + baseY + '" stroke="#999" stroke-width="1" stroke-dasharray="4,4"/>';
+      svg += '<text x="' + (width - padding.right) + '" y="' + (baseY - 4) + '" text-anchor="end" fill="#999" font-size="11">初始资金</text>';
+
+      // 填充区域
+      svg += '<path d="' + areaD + '" fill="' + areaColor + '"/>';
+
+      // 净值曲线
+      svg += '<path d="' + pathD + '" fill="none" stroke="' + lineColor + '" stroke-width="2"/>';
+
+      // 最新点
+      const last = points[points.length - 1];
+      svg += '<circle cx="' + last.x + '" cy="' + last.y + '" r="4" fill="' + lineColor + '"/>';
+      svg += '<text x="' + last.x + '" y="' + (last.y - 8) + '" text-anchor="middle" fill="' + lineColor + '" font-size="12" font-weight="bold">' + last.nav.toFixed(0) + '</text>';
+
+      // X轴日期（起点和终点）
+      svg += '<text x="' + padding.left + '" y="' + (height - padding.bottom + 18) + '" text-anchor="start" fill="#999" font-size="11">' + history[0].date + '</text>';
+      svg += '<text x="' + (width - padding.right) + '" y="' + (height - padding.bottom + 18) + '" text-anchor="end" fill="#999" font-size="11">' + history[history.length - 1].date + '</text>';
+
+      svg += '</svg>';
+      el.innerHTML = svg;
+    }}
+
+    function renderSimTransactions(data) {{
+      const el = document.getElementById('simTransactionsTable');
+      if (!el) return;
+      if (!data.ok) {{ el.innerHTML = '<div style="color:var(--danger);">错误：' + data.error + '</div>'; return; }}
+      const txns = data.transactions || [];
+      if (!txns.length) {{ el.innerHTML = '<div style="color:var(--muted);padding:20px;text-align:center;">暂无交易记录</div>'; return; }}
+      let html = '<table style="width:100%;border-collapse:collapse;font-size:13px;"><thead><tr style="background:var(--bg);">';
+      html += '<th style="padding:6px;border:1px solid var(--rule);">日期</th><th style="padding:6px;border:1px solid var(--rule);">代码</th><th style="padding:6px;border:1px solid var(--rule);">名称</th><th style="padding:6px;border:1px solid var(--rule);">类型</th><th style="padding:6px;border:1px solid var(--rule);">价格</th><th style="padding:6px;border:1px solid var(--rule);">股数</th><th style="padding:6px;border:1px solid var(--rule);">金额</th><th style="padding:6px;border:1px solid var(--rule);">盈亏</th><th style="padding:6px;border:1px solid var(--rule);">原因</th>';
+      html += '</tr></thead><tbody>';
+      txns.forEach(t => {{
+        const isBuy = t.type === 'buy';
+        const pnl = t.pnl || 0;
+        const pnlColor = pnl >= 0 ? 'var(--success)' : 'var(--danger)';
+        html += '<tr>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + t.date + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + t.symbol + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (t.name || '') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);color:' + (isBuy ? 'var(--accent)' : 'var(--danger)') + ';">' + (isBuy ? '买入' : '卖出') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + t.price + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + t.shares + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (t.amount || 0).toFixed(0) + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);color:' + pnlColor + ';">' + (t.pnl != null ? t.pnl.toFixed(2) : '—') + '</td>';
+        html += '<td style="padding:6px;border:1px solid var(--rule);">' + (t.reason || '') + '</td>';
+        html += '</tr>';
+      }});
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    }}
+
+    async function runSimulation() {{
+      const btn = document.getElementById('runSimulationBtn');
+      const hint = document.getElementById('simStatusHint');
+      if (btn) btn.disabled = true;
+      if (hint) hint.textContent = '模拟交易执行中...';
+
+      const res = await fetch('/simulation/run', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: '{{}}'
+      }});
+      const data = await res.json();
+      if (!data.ok) {{
+        alert(data.error || '启动失败');
+        if (btn) btn.disabled = false;
+        if (hint) hint.textContent = '启动失败';
+        return;
+      }}
+
+      // 轮询任务状态
+      const checkInterval = setInterval(async () => {{
+        const statusRes = await fetch('/status');
+        const status = await statusRes.json();
+        if (!status.running) {{
+          clearInterval(checkInterval);
+          if (btn) btn.disabled = false;
+          await loadSimulationData();
+          if (hint) hint.textContent = '模拟交易完成';
+        }} else {{
+          if (hint) hint.textContent = '执行中：' + (status.action || '');
+        }}
+      }}, 2000);
+    }}
   </script>
 </body>
 </html>"""
@@ -1935,6 +2343,19 @@ class Handler(BaseHTTPRequestHandler):
             symbol = parse_qs(parsed.query).get("symbol", [""])[0]
             self._send_json(_transactions_list(symbol))
             return
+        # ─── 模拟交易接口 ───
+        if self.path == "/simulation/account":
+            self._send_json(_sim_get_account())
+            return
+        if self.path == "/simulation/holdings":
+            self._send_json(_sim_get_holdings())
+            return
+        if self.path == "/simulation/nav-history":
+            self._send_json(_sim_get_nav_history())
+            return
+        if self.path == "/simulation/transactions":
+            self._send_json(_sim_get_transactions())
+            return
         if self.path.startswith("/candidate-detail"):
             parsed = urlparse(self.path)
             symbol = parse_qs(parsed.query).get("symbol", [""])[0]
@@ -1995,6 +2416,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_holdings_update(holding_id, payload))
                 return
             self._send_json({"ok": False, "error": "无效路径"}, 400)
+            return
+        # ─── 模拟交易：运行 ───
+        if self.path == "/simulation/run":
+            self._send_json(_sim_run())
             return
         if self.path != "/run":
             self._send_json({"ok": False, "error": "未知接口"}, 404)

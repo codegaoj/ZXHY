@@ -296,9 +296,20 @@ def fetch_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
             return "bj" + s
         return s
 
+    col_map = {
+        "日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
+        "最低": "low", "成交量": "volume", "成交额": "amount",
+        "收盘价": "close", "开盘价": "open", "最高价": "high", "最低价": "low",
+    }
+
+    def _normalize_cols(df):
+        if df is None or df.empty:
+            return df
+        return df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
     errors = []
     try:
-        return retry(
+        df = retry(
             lambda: ak.stock_zh_a_hist(
                 symbol=symbol,
                 period="daily",
@@ -310,10 +321,11 @@ def fetch_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
             times=1,
             pause=0.5,
         )
+        return _normalize_cols(df)
     except Exception as exc:
         errors.append(f"hist:{exc}")
     try:
-        return retry(
+        df = retry(
             lambda: ak.stock_zh_a_hist_tx(
                 symbol=prefixed(symbol),
                 start_date=start_date,
@@ -324,10 +336,11 @@ def fetch_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
             times=1,
             pause=0.5,
         )
+        return _normalize_cols(df)
     except Exception as exc:
         errors.append(f"tx:{exc}")
     try:
-        return retry(
+        df = retry(
             lambda: ak.stock_zh_a_daily(
                 symbol=prefixed(symbol),
                 start_date=start_date,
@@ -337,6 +350,7 @@ def fetch_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
             times=1,
             pause=0.5,
         )
+        return _normalize_cols(df)
     except Exception as exc:
         errors.append(f"daily:{exc}")
     raise RuntimeError("；".join(errors))
@@ -400,9 +414,7 @@ def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50, mar
         score += 8
         reasons.append("知行趋势达标")
     # ---- 实战信号评分 ----
-    if "滴滴战法" in tag_set:
-        score += 15
-        reasons.append("滴滴战法（缩量后放量反弹）")
+    # 缩量反弹：仅作观察标签，不参与评分（月复盘胜率43%/平均-1.24%，表现偏弱）
     if "放量长阳" in tag_set:
         score += 12
         reasons.append("放量长阳关键K线")

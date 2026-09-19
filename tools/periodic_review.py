@@ -46,6 +46,7 @@ class CandidateRecord:
     pct_change_at_select: float
     tags: str
     candidate_score: float
+    plan_action: str
     sector: str
     support_price: float
     resistance_price: float
@@ -91,6 +92,8 @@ class PeriodicStats:
     sector_performance: dict  # 板块平均收益
     tag_performance: dict  # 标签平均收益
     daily_breakdown: list  # 每日选入胜率
+    score_breakdown: list  # 评分分层胜率
+    action_breakdown: list  # 建议动作分层胜率
     broke_white_count: int  # 破白线数
     broke_yellow_count: int  # 破黄线数
 
@@ -406,6 +409,73 @@ def build_periodic_stats(perfs: list[PerformanceRecord], period_label: str, date
     broke_white_count = sum(1 for p in valid if p.broke_white)
     broke_yellow_count = sum(1 for p in valid if p.broke_yellow)
 
+    # 评分分层统计
+    def _score_tier(score: float) -> str:
+        if score >= 130:
+            return "≥130分（优秀）"
+        if score >= 110:
+            return "110-130分（良好）"
+        if score >= 90:
+            return "90-110分（中等）"
+        if score >= 70:
+            return "70-90分（一般）"
+        return "<70分（偏低）"
+
+    score_groups = defaultdict(lambda: {"count": 0, "returns": [], "win_count": 0})
+    for p in valid:
+        tier = _score_tier(p.record.candidate_score)
+        score_groups[tier]["count"] += 1
+        score_groups[tier]["returns"].append(p.return_pct)
+        if p.return_pct > 0.5:
+            score_groups[tier]["win_count"] += 1
+
+    score_tier_order = [
+        "≥130分（优秀）", "110-130分（良好）",
+        "90-110分（中等）", "70-90分（一般）", "<70分（偏低）",
+    ]
+    score_breakdown = []
+    for tier in score_tier_order:
+        if tier in score_groups:
+            g = score_groups[tier]
+            avg_ret = round(sum(g["returns"]) / len(g["returns"]), 2) if g["returns"] else 0.0
+            win_rate = round(g["win_count"] / g["count"] * 100, 1) if g["count"] else 0.0
+            score_breakdown.append({
+                "tier": tier, "count": g["count"],
+                "avg_return": avg_ret, "win_rate": win_rate,
+            })
+
+    # 建议动作分层统计
+    def _action_tier(action: str) -> str:
+        if "买入候选" in action:
+            return "建议买入"
+        if "观察" in action and "确认" in action:
+            return "观察确认"
+        if "观察" in action:
+            return "观察观望"
+        if "无操作" in action:
+            return "无操作"
+        return "其他"
+
+    action_groups = defaultdict(lambda: {"count": 0, "returns": [], "win_count": 0})
+    for p in valid:
+        tier = _action_tier(p.record.plan_action)
+        action_groups[tier]["count"] += 1
+        action_groups[tier]["returns"].append(p.return_pct)
+        if p.return_pct > 0.5:
+            action_groups[tier]["win_count"] += 1
+
+    action_tier_order = ["建议买入", "观察确认", "观察观望", "无操作", "其他"]
+    action_breakdown = []
+    for tier in action_tier_order:
+        if tier in action_groups:
+            g = action_groups[tier]
+            avg_ret = round(sum(g["returns"]) / len(g["returns"]), 2) if g["returns"] else 0.0
+            win_rate = round(g["win_count"] / g["count"] * 100, 1) if g["count"] else 0.0
+            action_breakdown.append({
+                "tier": tier, "count": g["count"],
+                "avg_return": avg_ret, "win_rate": win_rate,
+            })
+
     unique_stocks = len(set(p.record.symbol for p in perfs))
 
     return PeriodicStats(
@@ -427,6 +497,8 @@ def build_periodic_stats(perfs: list[PerformanceRecord], period_label: str, date
         sector_performance=dict(list(sector_perf.items())[:10]),
         tag_performance=dict(list(tag_perf.items())[:10]),
         daily_breakdown=daily_breakdown,
+        score_breakdown=score_breakdown,
+        action_breakdown=action_breakdown,
         broke_white_count=broke_white_count,
         broke_yellow_count=broke_yellow_count,
     )
@@ -556,6 +628,39 @@ def write_html(perfs: list[PerformanceRecord], stats: PeriodicStats, output: Pat
 
 <div class="grid-2">
   <section>
+    <h2>评分分层表现</h2>
+    <table>
+      <thead><tr><th>分数段</th><th>数量</th><th>平均收益</th><th>胜率</th></tr></thead>
+      <tbody>
+        {''.join(
+          f'<tr><td>{item["tier"]}</td><td>{item["count"]}</td>'
+          f'<td style="color:{"#4caf50" if item["avg_return"] >= 0 else "#f44336"};">{item["avg_return"]:+.2f}%</td>'
+          f'<td style="color:{"#4caf50" if item["win_rate"] >= 50 else "#f44336"};">{item["win_rate"]}%</td></tr>'
+          for item in stats.score_breakdown
+        ) or '<tr><td colspan="4" style="text-align:center;color:#999;">暂无数据</td></tr>'}
+      </tbody>
+    </table>
+    <p style="margin-top:8px;color:#667085;font-size:12px;">验证评分有效性：分数越高，胜率和平均收益是否越好？</p>
+  </section>
+  <section>
+    <h2>建议动作表现</h2>
+    <table>
+      <thead><tr><th>建议类型</th><th>数量</th><th>平均收益</th><th>胜率</th></tr></thead>
+      <tbody>
+        {''.join(
+          f'<tr><td>{item["tier"]}</td><td>{item["count"]}</td>'
+          f'<td style="color:{"#4caf50" if item["avg_return"] >= 0 else "#f44336"};">{item["avg_return"]:+.2f}%</td>'
+          f'<td style="color:{"#4caf50" if item["win_rate"] >= 50 else "#f44336"};">{item["win_rate"]}%</td></tr>'
+          for item in stats.action_breakdown
+        ) or '<tr><td colspan="4" style="text-align:center;color:#999;">暂无数据</td></tr>'}
+      </tbody>
+    </table>
+    <p style="margin-top:8px;color:#667085;font-size:12px;">验证建议质量：系统建议买入的股票表现是否优于无操作的？</p>
+  </section>
+</div>
+
+<div class="grid-2">
+  <section>
     <h2>板块平均收益</h2>
     <table>
       <thead><tr><th>板块</th><th>平均收益</th></tr></thead>
@@ -614,6 +719,8 @@ def write_json(perfs: list[PerformanceRecord], stats: PeriodicStats, output: Pat
             "sector_performance": stats.sector_performance,
             "tag_performance": stats.tag_performance,
             "daily_breakdown": stats.daily_breakdown,
+            "score_breakdown": stats.score_breakdown,
+            "action_breakdown": stats.action_breakdown,
         },
         "records": [
             {
@@ -635,6 +742,7 @@ def write_json(perfs: list[PerformanceRecord], stats: PeriodicStats, output: Pat
                 "sector": p.record.sector,
                 "tags": p.record.tags,
                 "candidate_score": p.record.candidate_score,
+                "plan_action": p.record.plan_action,
             }
             for p in sorted(perfs, key=lambda x: x.return_pct, reverse=True)
         ],
@@ -697,6 +805,7 @@ def main() -> None:
                 pct_change_at_select=to_float(row.get("pct_change")),
                 tags=str(row.get("tags", "")),
                 candidate_score=to_float(row.get("candidate_score")),
+                plan_action=str(row.get("plan_action", "")),
                 sector=str(row.get("sector", "")),
                 support_price=to_float(row.get("support_price")),
                 resistance_price=to_float(row.get("resistance_price")),

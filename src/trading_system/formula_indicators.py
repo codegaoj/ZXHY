@@ -150,8 +150,8 @@ def evaluate_formulas(df: pd.DataFrame) -> FormulaEvaluation:
     # 过去5日（截至昨日）成交量萎缩（< 前一日*0.9）的天数
     vol_shrink_count = (vol_ratio_to_prev < 0.9).rolling(5, min_periods=1).sum().shift(1)
 
-    # 1. 滴滴战法：缩量回调后放量反弹
-    didi = (
+    # 1. 缩量反弹：缩量回调后放量反弹（洗盘结束信号）
+    shrink_rebound = (
         (vol_shrink_count >= 3)  # 过去5日至少3天缩量
         & (volume > vol_avg_5 * 1.2)  # 今日放量
         & (pct_change > 0)  # 今日上涨
@@ -198,7 +198,7 @@ def evaluate_formulas(df: pd.DataFrame) -> FormulaEvaluation:
         & (volume > vol_avg_5 * 1.2)  # 今日放量
     )
 
-    signals["滴滴战法"] = bool(didi.iloc[-1])
+    signals["缩量反弹"] = bool(shrink_rebound.iloc[-1])
     signals["放量长阳"] = bool(key_long_yang.iloc[-1])
     signals["锤头线"] = bool(key_hammer.iloc[-1])
     signals["回踩白线"] = bool(pullback_white.iloc[-1])
@@ -215,8 +215,8 @@ def evaluate_formulas(df: pd.DataFrame) -> FormulaEvaluation:
     if signals["BBI_MA60多头"]:
         tags.append("BBI/MA60")
 
-    if signals["滴滴战法"]:
-        tags.append("滴滴战法")
+    if signals["缩量反弹"]:
+        tags.append("缩量反弹")
     if signals["放量长阳"]:
         tags.append("放量长阳")
     if signals["锤头线"]:

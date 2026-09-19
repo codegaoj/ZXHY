@@ -40,8 +40,12 @@ def _detect_rule_hits(snapshot: SecuritySnapshot, window: pd.DataFrame) -> Dict[
     if "S1/卖点" in snapshot.tags and snapshot.pct_change < -2:
         hits["S1"] = "标签命中 S1/卖点，且当日跌幅超过 2%。"
 
-    if "滴滴战法" in snapshot.tags and snapshot.close < snapshot.prev_close and snapshot.volume < snapshot.volume_ma5:
-        hits["滴滴"] = "标签命中滴滴战法，且缩量下跌。"
+    # 滴滴战法：收盘价跌破前一日最低价（持仓跟踪止损信号）
+    if snapshot.prev_low > 0 and snapshot.close < snapshot.prev_low:
+        hits["滴滴"] = (
+            f"收盘价{round(snapshot.close, 2)}跌破前一日最低价{round(snapshot.prev_low, 2)}，"
+            f"触发滴滴战法减仓/止损信号。"
+        )
 
     if formula.signals.get("砖型图反红"):
         hits["砖形图"] = "砖型图昨天绿柱、今天反红，且高度达标。"

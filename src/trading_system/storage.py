@@ -187,6 +187,78 @@ CREATE INDEX IF NOT EXISTS idx_reviews_symbol ON candidate_reviews(symbol);
 CREATE INDEX IF NOT EXISTS idx_holdings_symbol ON holdings(symbol);
 CREATE INDEX IF NOT EXISTS idx_holdings_status ON holdings(status);
 CREATE INDEX IF NOT EXISTS idx_transactions_symbol ON transactions(symbol);
+
+-- ─── 模拟交易 ───
+
+CREATE TABLE IF NOT EXISTS sim_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    initial_capital REAL NOT NULL,
+    current_cash REAL NOT NULL,
+    total_value REAL NOT NULL,
+    strategy TEXT,
+    status TEXT DEFAULT 'active',
+    start_date TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    updated_at TEXT DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS sim_holdings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT,
+    buy_date TEXT NOT NULL,
+    buy_price REAL NOT NULL,
+    shares INTEGER NOT NULL,
+    cost_price REAL,
+    current_price REAL,
+    pnl REAL DEFAULT 0,
+    pnl_pct REAL DEFAULT 0,
+    status TEXT DEFAULT 'open',
+    sell_date TEXT,
+    sell_price REAL,
+    sell_reason TEXT,
+    FOREIGN KEY (account_id) REFERENCES sim_accounts(id)
+);
+
+CREATE TABLE IF NOT EXISTS sim_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    holding_id INTEGER,
+    symbol TEXT NOT NULL,
+    name TEXT,
+    type TEXT NOT NULL,
+    date TEXT NOT NULL,
+    price REAL NOT NULL,
+    shares INTEGER NOT NULL,
+    amount REAL,
+    commission REAL DEFAULT 0,
+    pnl REAL,
+    pnl_pct REAL,
+    reason TEXT,
+    FOREIGN KEY (account_id) REFERENCES sim_accounts(id),
+    FOREIGN KEY (holding_id) REFERENCES sim_holdings(id)
+);
+
+CREATE TABLE IF NOT EXISTS sim_nav_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    nav REAL NOT NULL,
+    cash REAL NOT NULL,
+    market_value REAL NOT NULL,
+    daily_return_pct REAL DEFAULT 0,
+    total_return_pct REAL DEFAULT 0,
+    holding_count INTEGER DEFAULT 0,
+    UNIQUE(account_id, date),
+    FOREIGN KEY (account_id) REFERENCES sim_accounts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sim_holdings_account ON sim_holdings(account_id);
+CREATE INDEX IF NOT EXISTS idx_sim_holdings_status ON sim_holdings(status);
+CREATE INDEX IF NOT EXISTS idx_sim_transactions_account ON sim_transactions(account_id);
+CREATE INDEX IF NOT EXISTS idx_sim_nav_account_date ON sim_nav_history(account_id, date);
 """
 
 
@@ -744,4 +816,187 @@ class Storage:
             cur = self.conn.execute(
                 "SELECT * FROM transactions ORDER BY date DESC LIMIT ?", (limit,)
             )
+        return [dict(r) for r in cur.fetchall()]
+
+    # ─── 模拟交易：账户 ───
+
+    def create_sim_account(
+        self,
+        name: str,
+        initial_capital: float,
+        strategy: str = "full_buy",
+        start_date: str = "",
+    ) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO sim_accounts (name,initial_capital,current_cash,total_value,strategy,start_date) "
+            "VALUES (?,?,?,?,?,?)",
+            (name, initial_capital, initial_capital, initial_capital, strategy, start_date),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_sim_account(self, account_id: int) -> Optional[dict]:
+        cur = self.conn.execute("SELECT * FROM sim_accounts WHERE id=?", (account_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_sim_account_by_name(self, name: str) -> Optional[dict]:
+        cur = self.conn.execute("SELECT * FROM sim_accounts WHERE name=?", (name,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_sim_accounts(self) -> List[dict]:
+        cur = self.conn.execute("SELECT * FROM sim_accounts ORDER BY id")
+        return [dict(r) for r in cur.fetchall()]
+
+    def update_sim_account(self, account_id: int, **fields) -> None:
+        allowed = {"current_cash", "total_value", "status"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        sets = ", ".join(f"{k}=?" for k in updates)
+        vals = list(updates.values()) + [account_id]
+        self.conn.execute(
+            f"UPDATE sim_accounts SET {sets}, updated_at=datetime('now','localtime') WHERE id=?",
+            vals,
+        )
+        self.conn.commit()
+
+    # ─── 模拟交易：持仓 ───
+
+    def add_sim_holding(
+        self,
+        account_id: int,
+        symbol: str,
+        name: str,
+        buy_date: str,
+        buy_price: float,
+        shares: int,
+        commission: float = 0.0,
+    ) -> int:
+        cost_price = buy_price + (commission / shares if shares else 0)
+        cur = self.conn.execute(
+            "INSERT INTO sim_holdings "
+            "(account_id,symbol,name,buy_date,buy_price,shares,cost_price,current_price,pnl,pnl_pct,status) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?, 'open')",
+            (account_id, symbol, name, buy_date, buy_price, shares, cost_price, buy_price, 0.0, 0.0),
+        )
+        holding_id = cur.lastrowid
+        self.conn.execute(
+            "INSERT INTO sim_transactions "
+            "(account_id,holding_id,symbol,name,type,date,price,shares,amount,commission,reason) "
+            "VALUES (?,?,?, 'buy', ?, ?, ?, ?, ?, ?, ?)",
+            (account_id, holding_id, symbol, name, buy_date, buy_price, shares,
+             buy_price * shares, commission, "模拟买入"),
+        )
+        self.conn.commit()
+        return holding_id
+
+    def get_sim_open_holdings(self, account_id: int) -> List[dict]:
+        cur = self.conn.execute(
+            "SELECT * FROM sim_holdings WHERE account_id=? AND status='open' ORDER BY buy_date",
+            (account_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_sim_all_holdings(self, account_id: int, limit: int = 200) -> List[dict]:
+        cur = self.conn.execute(
+            "SELECT * FROM sim_holdings WHERE account_id=? ORDER BY buy_date DESC LIMIT ?",
+            (account_id, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def update_sim_holding_price(self, holding_id: int, current_price: float) -> None:
+        cur = self.conn.execute(
+            "SELECT cost_price, shares FROM sim_holdings WHERE id=?", (holding_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        cost = row["cost_price"] * row["shares"]
+        market_value = current_price * row["shares"]
+        pnl = market_value - cost
+        pnl_pct = (pnl / cost * 100) if cost else 0.0
+        self.conn.execute(
+            "UPDATE sim_holdings SET current_price=?, pnl=?, pnl_pct=? WHERE id=?",
+            (current_price, round(pnl, 2), round(pnl_pct, 2), holding_id),
+        )
+
+    def close_sim_holding(
+        self,
+        holding_id: int,
+        sell_date: str,
+        sell_price: float,
+        commission: float = 0.0,
+        reason: str = "",
+    ) -> dict:
+        cur = self.conn.execute("SELECT * FROM sim_holdings WHERE id=?", (holding_id,))
+        holding = cur.fetchone()
+        if not holding:
+            raise ValueError(f"模拟持仓 {holding_id} 不存在")
+        shares = holding["shares"]
+        cost = holding["cost_price"] * shares
+        revenue = sell_price * shares - commission
+        pnl = revenue - cost
+        pnl_pct = (pnl / cost * 100) if cost else 0.0
+        self.conn.execute(
+            "INSERT INTO sim_transactions "
+            "(account_id,holding_id,symbol,name,type,date,price,shares,amount,commission,pnl,pnl_pct,reason) "
+            "VALUES (?,?,?,?, 'sell', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (holding["account_id"], holding_id, holding["symbol"], holding["name"],
+             sell_date, sell_price, shares, sell_price * shares, commission,
+             round(pnl, 2), round(pnl_pct, 2), reason),
+        )
+        self.conn.execute(
+            "UPDATE sim_holdings SET status='closed', sell_date=?, sell_price=?, sell_reason=?, "
+            "current_price=?, pnl=?, pnl_pct=? WHERE id=?",
+            (sell_date, sell_price, reason, sell_price, round(pnl, 2), round(pnl_pct, 2), holding_id),
+        )
+        self.conn.commit()
+        return {"pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2), "shares": shares}
+
+    # ─── 模拟交易：净值历史 ───
+
+    def save_sim_nav(
+        self,
+        account_id: int,
+        nav_date: str,
+        nav: float,
+        cash: float,
+        market_value: float,
+        daily_return_pct: float = 0.0,
+        total_return_pct: float = 0.0,
+        holding_count: int = 0,
+    ) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sim_nav_history "
+            "(account_id,date,nav,cash,market_value,daily_return_pct,total_return_pct,holding_count) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (account_id, nav_date, round(nav, 2), round(cash, 2), round(market_value, 2),
+             round(daily_return_pct, 2), round(total_return_pct, 2), holding_count),
+        )
+        self.conn.commit()
+
+    def get_sim_nav_history(self, account_id: int, limit: int = 500) -> List[dict]:
+        cur = self.conn.execute(
+            "SELECT * FROM sim_nav_history WHERE account_id=? ORDER BY date LIMIT ?",
+            (account_id, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_latest_sim_nav(self, account_id: int) -> Optional[dict]:
+        cur = self.conn.execute(
+            "SELECT * FROM sim_nav_history WHERE account_id=? ORDER BY date DESC LIMIT 1",
+            (account_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    # ─── 模拟交易：交易记录 ───
+
+    def get_sim_transactions(self, account_id: int, limit: int = 200) -> List[dict]:
+        cur = self.conn.execute(
+            "SELECT * FROM sim_transactions WHERE account_id=? ORDER BY date DESC, id DESC LIMIT ?",
+            (account_id, limit),
+        )
         return [dict(r) for r in cur.fetchall()]

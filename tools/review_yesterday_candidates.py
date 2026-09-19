@@ -419,6 +419,43 @@ def write_html(rows: list[dict], stats: dict, path: Path) -> None:
 
     <div class="grid2">
       <section>
+        <h2>评分分层表现</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>分数段</th><th>数量</th><th>平均收益</th><th>上涨占比</th></tr></thead>
+            <tbody>
+              {''.join(
+                f'<tr><td>{item["tier"]}</td><td>{item["count"]}</td>'
+                f'<td class="{pct_class(item["avg_return"])}">{fmt_pct(item["avg_return"])}</td>'
+                f'<td>{item["win_rate"]}%</td></tr>'
+                for item in stats["score_breakdown"]
+              ) or '<tr><td colspan="4" style="text-align:center;color:#999;">暂无数据</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <p class="note">分数越高是否收益越好？用于验证选股评分的有效性。</p>
+      </section>
+      <section>
+        <h2>建议动作表现</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>建议类型</th><th>数量</th><th>平均收益</th><th>上涨占比</th></tr></thead>
+            <tbody>
+              {''.join(
+                f'<tr><td>{item["tier"]}</td><td>{item["count"]}</td>'
+                f'<td class="{pct_class(item["avg_return"])}">{fmt_pct(item["avg_return"])}</td>'
+                f'<td>{item["win_rate"]}%</td></tr>'
+                for item in stats["action_breakdown"]
+              ) or '<tr><td colspan="4" style="text-align:center;color:#999;">暂无数据</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <p class="note">系统建议买入的股票次日表现是否优于无操作建议的？用于验证交易计划的质量。</p>
+      </section>
+    </div>
+
+    <div class="grid2">
+      <section>
         <h2>涨幅前 10</h2>
         <div class="table-wrap">
           <table>
@@ -468,12 +505,95 @@ def write_html(rows: list[dict], stats: dict, path: Path) -> None:
     path.write_text(body, encoding="utf-8")
 
 
+def _score_tier(score: float) -> str:
+    """按候选分数划分档次。"""
+    if score >= 130:
+        return "≥130分（优秀）"
+    if score >= 110:
+        return "110-130分（良好）"
+    if score >= 90:
+        return "90-110分（中等）"
+    if score >= 70:
+        return "70-90分（一般）"
+    return "<70分（偏低）"
+
+
+def _action_tier(action: str) -> str:
+    """按建议动作归类。"""
+    if "买入候选" in action:
+        return "建议买入"
+    if "观察" in action and "确认" in action:
+        return "观察确认"
+    if "观察" in action:
+        return "观察观望"
+    if "无操作" in action:
+        return "无操作"
+    return "其他"
+
+
 def build_stats(rows: list[dict]) -> dict:
     valid = [row for row in rows if row["today_close"] > 0]
     distribution = {"强势": 0, "偏强": 0, "震荡": 0, "偏弱": 0, "弱势": 0}
     for row in valid:
         distribution[row["performance_category"]] += 1
     avg_change = round(sum(row["change_from_selected"] for row in valid) / len(valid), 2) if valid else 0.0
+
+    # 评分分层统计
+    score_groups = {}
+    for row in valid:
+        tier = _score_tier(row["candidate_score"])
+        if tier not in score_groups:
+            score_groups[tier] = {"count": 0, "returns": [], "up_count": 0}
+        score_groups[tier]["count"] += 1
+        score_groups[tier]["returns"].append(row["change_from_selected"])
+        if row["change_from_selected"] > 0:
+            score_groups[tier]["up_count"] += 1
+
+    score_tier_order = [
+        "≥130分（优秀）",
+        "110-130分（良好）",
+        "90-110分（中等）",
+        "70-90分（一般）",
+        "<70分（偏低）",
+    ]
+    score_breakdown = []
+    for tier in score_tier_order:
+        if tier in score_groups:
+            g = score_groups[tier]
+            avg_ret = round(sum(g["returns"]) / len(g["returns"]), 2) if g["returns"] else 0.0
+            win_rate = round(g["up_count"] / g["count"] * 100, 1) if g["count"] else 0.0
+            score_breakdown.append({
+                "tier": tier,
+                "count": g["count"],
+                "avg_return": avg_ret,
+                "win_rate": win_rate,
+            })
+
+    # 建议动作分层统计
+    action_groups = {}
+    for row in valid:
+        tier = _action_tier(row["plan_action"])
+        if tier not in action_groups:
+            action_groups[tier] = {"count": 0, "returns": [], "up_count": 0}
+        action_groups[tier]["count"] += 1
+        action_groups[tier]["returns"].append(row["change_from_selected"])
+        if row["change_from_selected"] > 0:
+            action_groups[tier]["up_count"] += 1
+
+    action_tier_order = ["建议买入", "观察确认", "观察观望", "无操作", "其他"]
+    action_breakdown = []
+    for tier in action_tier_order:
+        if tier in action_groups:
+            g = action_groups[tier]
+            avg_ret = round(sum(g["returns"]) / len(g["returns"]), 2) if g["returns"] else 0.0
+            win_rate = round(g["up_count"] / g["count"] * 100, 1) if g["count"] else 0.0
+            action_breakdown.append({
+                "tier": tier,
+                "count": g["count"],
+                "avg_return": avg_ret,
+                "win_rate": win_rate,
+            })
+
     return {
         "total": len(rows),
         "valid": len(valid),
@@ -485,6 +605,8 @@ def build_stats(rows: list[dict]) -> dict:
         "broke_white_count": sum(1 for row in valid if row["broke_white"]),
         "broke_yellow_count": sum(1 for row in valid if row["broke_yellow"]),
         "distribution": distribution,
+        "score_breakdown": score_breakdown,
+        "action_breakdown": action_breakdown,
     }
 
 

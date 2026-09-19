@@ -106,8 +106,8 @@ def _detect_tag_conflicts(tags: set, pct_change: float) -> list[str]:
     if "突破压力" in tags and "破白线" in tags:
         issues.append("[矛盾]突破压力与破白线共存")
 
-    if "滴滴战法" in tags and pct_change > 8:
-        issues.append(f"[矛盾]滴滴战法但涨幅{pct_change:.1f}%>8%")
+    if "缩量反弹" in tags and pct_change > 8:
+        issues.append(f"[矛盾]缩量反弹但涨幅{pct_change:.1f}%>8%")
 
     if "锤头线" in tags and "放量长阳" in tags:
         issues.append("[矛盾]锤头线与放量长阳形态冲突")
@@ -321,7 +321,7 @@ def _identify_highlights(row: dict, tags: set, risk_reward: float) -> list[str]:
     highlights: list[str] = []
 
     # 多信号共振
-    signal_tags = {"滴滴战法", "放量长阳", "锤头线", "回踩白线", "突破压力", "B1/B2买点", "单针战法"}
+    signal_tags = {"缩量反弹", "放量长阳", "锤头线", "回踩白线", "突破压力", "B1/B2买点", "单针战法"}
     signal_count = len(tags & signal_tags)
     if signal_count >= 3:
         highlights.append(f"多信号共振（{signal_count}个买点信号叠加）")

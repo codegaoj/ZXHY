@@ -198,6 +198,31 @@ class RiskEngine:
                 triggered_rules=["初始止损"],
             ))
 
+        # 滴滴战法：跌破前一日最低价触发减仓/止损
+        if snapshot.prev_low > 0 and snapshot.close < snapshot.prev_low:
+            if snapshot.close >= snapshot.white_line:
+                # 白线之上的滴容易卖飞，建议减仓观察
+                didi_action = "减仓观察"
+                didi_reason = (
+                    f"收盘价{round(snapshot.close, 2)}元跌破前一日最低价"
+                    f"{round(snapshot.prev_low, 2)}元，触发滴滴战法。"
+                    f"价格仍在白线上方，可减仓1/2保留观察仓位。"
+                )
+            else:
+                # 白线之下的滴，建议止损离场
+                didi_action = "止损离场"
+                didi_reason = (
+                    f"收盘价{round(snapshot.close, 2)}元跌破前一日最低价"
+                    f"{round(snapshot.prev_low, 2)}元，且已破白线，触发滴滴战法止损。"
+                )
+            actions.append(RiskAction(
+                symbol=snapshot.symbol,
+                action=didi_action,
+                priority=self._priority("滴滴战法"),
+                reason=didi_reason,
+                triggered_rules=["滴滴战法"],
+            ))
+
         if snapshot.close < snapshot.white_line:
             actions.append(RiskAction(
                 symbol=snapshot.symbol,

@@ -12,6 +12,7 @@ SNAPSHOT_FIELDS = [
     "name",
     "close",
     "prev_close",
+    "prev_low",
     "volume",
     "volume_ma5",
     "active_market_value_pct",
@@ -36,6 +37,7 @@ def snapshot_from_row(row: dict) -> SecuritySnapshot:
         name=str(row["name"]).strip(),
         close=float(row["close"]),
         prev_close=float(row["prev_close"]),
+        prev_low=float(row.get("prev_low", 0.0)),  # 兼容旧版快照文件
         volume=float(row["volume"]),
         volume_ma5=float(row["volume_ma5"]),
         active_market_value_pct=float(row["active_market_value_pct"]),
@@ -55,6 +57,7 @@ def snapshot_to_row(snapshot: SecuritySnapshot) -> dict:
         "name": snapshot.name,
         "close": snapshot.close,
         "prev_close": snapshot.prev_close,
+        "prev_low": snapshot.prev_low,
         "volume": snapshot.volume,
         "volume_ma5": snapshot.volume_ma5,
         "active_market_value_pct": snapshot.active_market_value_pct,
