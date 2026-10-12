@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>交易系统逻辑文档</title>
+<style>
+:root {
+  --bg: #f6f7fb; --bg2: #fff; --ink: #172033; --muted: #667085;
+  --rule: #e5e7eb; --accent: #355cff; --danger: #b9382f; --green: #1a7f37;
+  --amber: #b8860b; --tag-bg: #eef2ff;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: "Microsoft YaHei", system-ui, sans-serif; line-height: 1.7; }
+main { max-width: 1100px; margin: 0 auto; padding: 32px 20px 64px; }
+header, section { background: var(--bg2); border: 1px solid var(--rule); border-radius: 16px; padding: 28px; margin-bottom: 20px; }
+h1 { margin: 0 0 6px; font-size: 32px; }
+h2 { margin: 0 0 14px; font-size: 24px; border-bottom: 2px solid var(--accent); padding-bottom: 8px; }
+h3 { margin: 20px 0 10px; font-size: 18px; color: var(--accent); }
+h4 { margin: 16px 0 8px; font-size: 15px; }
+p { color: var(--muted); margin: 0 0 12px; }
+ul, ol { color: var(--ink); margin: 0 0 14px; padding-left: 24px; }
+li { margin-bottom: 6px; }
+code { background: var(--tag-bg); color: var(--accent); padding: 2px 6px; border-radius: 4px; font-size: 13px; font-family: Consolas, monospace; }
+pre { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 12px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+pre code { background: none; color: inherit; padding: 0; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 12px 0; }
+th, td { padding: 10px 12px; border-bottom: 1px solid var(--rule); text-align: left; }
+th { background: var(--bg); color: var(--muted); font-weight: 600; }
+tr:hover { background: var(--bg); }
+.tag { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; margin: 2px; }
+.tag-bull { background: #e6f4ea; color: var(--green); }
+.tag-strong { background: #e8f0fe; color: var(--accent); }
+.tag-balanced { background: #fef3e2; color: var(--amber); }
+.tag-weak { background: #fef0f0; color: var(--danger); }
+.tag-bear { background: #fce4ec; color: var(--danger); }
+.note { border-left: 4px solid var(--accent); padding: 14px 18px; background: var(--bg); border-radius: 10px; margin: 14px 0; }
+.note p { color: var(--ink); margin: 0; }
+.flow-box { background: var(--bg); border: 1px solid var(--rule); border-radius: 12px; padding: 20px; margin: 16px 0; font-size: 14px; }
+.flow-box strong { color: var(--accent); }
+.toc { columns: 2; column-gap: 32px; }
+.toc li { break-inside: avoid; }
+.toc a { color: var(--accent); text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+.score-table td:nth-child(2), .score-table td:nth-child(3) { text-align: right; font-family: Consolas; }
+@media (max-width: 768px) { .toc { columns: 1; } }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>交易系统逻辑文档</h1>
+  <p>版本：2026-09-20 | 适用于 <code>trading-system-core</code> 项目</p>
+  <div class="note">
+    <p>本文档描述系统的整体架构、数据流、核心引擎规则、选股评分逻辑、风控体系和配置参数。系统基于白线/黄线趋势框架、MACD 指标、活跃市值百分比和多种战法信号，实现从市场状态判定到选股、风控、仓位管理的完整交易决策链路。</p>
+  </div>
+</header>
+
+<section>
+  <h2 id="toc">目录</h2>
+  <div class="toc">
+    <ol>
+      <li><a href="#arch">系统架构总览</a></li>
+      <li><a href="#data">数据源与输入层</a></li>
+      <li><a href="#market">市场状态判定引擎</a></li>
+      <li><a href="#entry">入场信号引擎</a></li>
+      <li><a href="#risk">风控引擎</a></li>
+      <li><a href="#plan">交易计划引擎</a></li>
+      <li><a href="#indicators">指标公式体系</a></li>
+      <li><a href="#chart">图形质量评分</a></li>
+      <li><a href="#scoring">选股评分逻辑</a></li>
+      <li><a href="#pipeline">选股流程</a></li>
+      <li><a href="#config">配置参数总表</a></li>
+      <li><a href="#storage">数据持久化</a></li>
+    </ol>
+  </div>
+</section>
+
+<!-- ==================== 1. 架构总览 ==================== -->
+<section>
+  <h2 id="arch">1. 系统架构总览</h2>
+
+  <h3>核心模块关系</h3>
+  <div class="flow-box">
+<pre><code>rulebook.json (配置)
+    │
+    ▼
+Rulebook (配置读取器)
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│            TradePlanEngine              │
+│  ┌─────────────┐ ┌──────────────────┐   │
+│  │MarketTiming │ │ EntrySignalEngine│   │
+│  │  Engine     │ │                  │   │
+│  │(市场判定)   │ │ (入场信号)        │   │
+│  └─────────────┘ └──────────────────┘   │
+│  ┌─────────────┐ ┌──────────────────┐   │
+│  │ RiskEngine  │ │  build_plan()    │   │
+│  │ (风控)      │ │  (交易计划合成)   │   │
+│  └─────────────┘ └──────────────────┘   │
+└─────────────────────────────────────────┘
+    │
+    ▼
+formula_indicators.py ──→ SecuritySnapshot (标签/指标)
+chart_quality.py ──────→ ChartQualityResult (图形评分)
+    │
+    ▼
+screen_daily_candidates.py / screen_next_monday_candidates.py
+    │
+    ▼
+outputs/ (CSV + HTML + JSON) + SQLite (data/trading_system.db)</pre>
+    </code></pre>
+  </div>
+
+  <h3>模块清单</h3>
+  <table>
+    <tr><th>模块</th><th>文件</th><th>职责</th></tr>
+    <tr><td>配置中心</td><td><code>config/rulebook.json</code> + <code>rulebook.py</code></td><td>所有规则参数的单一来源</td></tr>
+    <tr><td>市场引擎</td><td><code>engines.py: MarketTimingEngine</code></td><td>判定5档市场状态</td></tr>
+    <tr><td>入场引擎</td><td><code>engines.py: EntrySignalEngine</code></td><td>生成买入信号及评分</td></tr>
+    <tr><td>风控引擎</td><td><code>engines.py: RiskEngine</code></td><td>8条风控规则按优先级触发</td></tr>
+    <tr><td>计划引擎</td><td><code>engines.py: TradePlanEngine</code></td><td>合成最终交易计划</td></tr>
+    <tr><td>指标公式</td><td><code>formula_indicators.py</code></td><td>白线/黄线/MACD/B1/B2/砖形图等</td></tr>
+    <tr><td>图形评分</td><td><code>chart_quality.py</code></td><td>K线形态质量0-100分</td></tr>
+    <tr><td>数据归一</td><td><code>data_normalizer.py</code></td><td>行情→SecuritySnapshot</td></tr>
+    <tr><td>选股脚本</td><td><code>tools/screen_daily_candidates.py</code></td><td>每日选股全流程</td></tr>
+    <tr><td>周一脚本</td><td><code>tools/screen_next_monday_candidates.py</code></td><td>周一选股（同流程）</td></tr>
+    <tr><td>数据持久化</td><td><code>storage.py</code></td><td>SQLite 15张表</td></tr>
+    <tr><td>收盘报告</td><td><code>daily_report.py</code></td><td>HTML格式复盘报告</td></tr>
+  </table>
+</section>
+
+<!-- ==================== 2. 数据源 ==================== -->
+<section>
+  <h2 id="data">2. 数据源与输入层</h2>
+
+  <h3>活跃市值百分比</h3>
+  <ul>
+    <li>来源：Compass 面板导出的 <code>data/compass_active_market_value.csv</code></li>
+    <li>读取逻辑：取文件最后一行的 <code>active_market_value_pct</code> 字段</li>
+    <li>近3日值：用于3日累计多头判定</li>
+    <li>回退默认值：4.82%（文件不存在或读取失败时）</li>
+  </ul>
+
+  <h3>实时行情</h3>
+  <ul>
+    <li>优先读取今日缓存 <code>data/a_spot_latest.csv</code>（每日脚本校验修改日期是否为交易日）</li>
+    <li>三级降级：<code>ak.stock_zh_a_spot()</code> → <code>ak.stock_zh_a_spot_em()</code> → <code>ak.stock_info_a_code_name()</code></li>
+  </ul>
+
+  <h3>历史日线</h3>
+  <ul>
+    <li>三级重试：<code>ak.stock_zh_a_hist()</code> → <code>ak.stock_zh_a_hist_tx()</code> → <code>ak.stock_zh_a_daily()</code></li>
+    <li>前缀规则：6开头→sh，0/3开头→sz，4/8/9开头→bj</li>
+    <li>前复权（qfq），180天历史数据</li>
+  </ul>
+
+  <h3>股票池过滤</h3>
+  <ul>
+    <li>排除300开头（创业板）、688开头（科创板）、ST/退市、无成交</li>
+    <li>北交所股票（920/8开头）在回测中被过滤</li>
+  </ul>
+</section>
+
+<!-- ==================== 3. 市场状态 ==================== -->
+<section>
+  <h2 id="market">3. 市场状态判定引擎</h2>
+
+  <p>市场状态是系统的"仓位控制阀"和"进攻信号过滤器"，由活跃市值百分比和MACD综合判定为5档：</p>
+
+  <table>
+    <tr>
+      <th>状态</th><th>判定条件</th><th>最大仓位</th><th>单标的仓位</th><th>标签</th>
+    </tr>
+    <tr>
+      <td><span class="tag tag-bull">牛市 BULL</span></td>
+      <td>活跃市值 ≥ 4.0% 且 MACD DIF > 0<br>或3日累计 ≥ 4.0% 且 MACD DIF > 0</td>
+      <td>80%</td><td>20%</td>
+    </tr>
+    <tr>
+      <td><span class="tag tag-strong">震荡偏强</span></td>
+      <td>活跃市值 ≥ 1.0%</td>
+      <td>50%</td><td>12%</td>
+    </tr>
+    <tr>
+      <td><span class="tag tag-balanced">震荡中性</span></td>
+      <td>-0.5% &lt; 活跃市值 &lt; 1.0%</td>
+      <td>35%</td><td>8%</td>
+    </tr>
+    <tr>
+      <td><span class="tag tag-weak">震荡偏弱</span></td>
+      <td>活跃市值 ≤ -0.5%</td>
+      <td>20%</td><td>5%</td>
+    </tr>
+    <tr>
+      <td><span class="tag tag-bear">熊市 BEAR</span></td>
+      <td>活跃市值 ≤ -2.3%</td>
+      <td>10%</td><td>3%</td>
+    </tr>
+  </table>
+
+  <div class="note">
+    <p><strong>核心作用：</strong>市场状态不改变选股池大小，但影响①入场信号评分（弱市扣分）②预筛条件（弱市选抗跌股）③交易计划动作和仓位④B2买点仅允许在牛市和震荡偏强⑤信号环境过滤（弱市仅允许特定信号）。</p>
+  </div>
+
+  <h3>手动覆盖</h3>
+  <p>支持 <code>--market-override</code> 参数强制指定状态，跳过自动判定。可选值：<code>bull</code> / <code>neutral_strong</code> / <code>neutral_balanced</code> / <code>neutral_weak</code> / <code>bear</code>。</p>
+</section>
+
+<!-- ==================== 4. 入场信号 ==================== -->
+<section>
+  <h2 id="entry">4. 入场信号引擎</h2>
+
+  <h3>4个核心战法</h3>
+  <table>
+    <tr><th>战法</th><th>条件</th><th>标签</th><th>基础分</th></tr>
+    <tr>
+      <td>B1买点</td>
+      <td>KDJ的J值 &lt; 15 且 知行趋势达标（close > 知行多空线 且 知行趋势线 > 知行多空线）</td>
+      <td><code>B1/B2买点</code></td><td>20</td>
+    </tr>
+    <tr>
+      <td>B2买点</td>
+      <td>B1后1-5日内，涨幅 &gt; 4%，放量，J &lt; 55，趋势达标，无长上影<br><strong>仅牛市和震荡偏强允许</strong></td>
+      <td><code>B1/B2买点</code></td><td>20</td>
+    </tr>
+    <tr>
+      <td>单针战法</td>
+      <td>四周期RSI均 ≤ 6，或短期RSI ≤ 20 且长期 ≥ 70，或短期上穿长期/中期</td>
+      <td><code>单针战法</code></td><td>15</td>
+    </tr>
+    <tr>
+      <td>砖形图反红</td>
+      <td>自定义砖形图指标出现反转信号</td>
+      <td><code>砖形图</code></td><td>20</td>
+    </tr>
+  </table>
+
+  <h3>5个辅助信号（技术信号，非战法）</h3>
+  <table>
+    <tr><th>信号</th><th>条件</th><th>选股加分</th></tr>
+    <tr><td>缩量反弹</td><td>过去5日至少3天缩量、今日放量、上涨且趋势达标</td><td>仅观察标签，不加分</td></tr>
+    <tr><td>放量长阳</td><td>实体涨幅 &gt; 3%，量比前5日均 &gt; 1.5倍，上影线 &lt; 30%</td><td>+12</td></tr>
+    <tr><td>锤头线</td><td>下影线 &gt; 实体2倍，上影线 &lt; 实体0.5倍，创近5日新低</td><td>+10</td></tr>
+    <tr><td>回踩白线</td><td>前1-2日低点回踩白线，今日站上白线并上涨</td><td>+14</td></tr>
+    <tr><td>突破压力</td><td>昨日 &lt; 近20日最高压力位，今日收盘突破并放量</td><td>+13</td></tr>
+  </table>
+
+  <h3>信号组合加分</h3>
+  <p>当多个信号同时出现时，按 <code>rulebook.json</code> 的 <code>combo_bonus</code> 配置加分，例如：</p>
+  <ul>
+    <li>B1买点 + 回踩白线 → +18</li>
+    <li>B1买点 + 缩量反弹 → +18</li>
+    <li>B1买点 + 放量长阳 → +15</li>
+    <li>砖形图 + 双线/白黄线 → +10</li>
+    <li>... 共12种组合</li>
+  </ul>
+
+  <h3>环境惩罚</h3>
+  <table>
+    <tr><th>市场状态</th><th>信号分数惩罚</th></tr>
+    <tr><td>牛市</td><td>0（无惩罚）</td></tr>
+    <tr><td>震荡偏强</td><td>0（无惩罚）</td></tr>
+    <tr><td>震荡中性</td><td>-5</td></tr>
+    <tr><td>震荡偏弱</td><td>-12</td></tr>
+    <tr><td>熊市</td><td>-25</td></tr>
+  </table>
+</section>
+
+<!-- ==================== 5. 风控引擎 ==================== -->
+<section>
+  <h2 id="risk">5. 风控引擎</h2>
+
+  <p>8条风控规则按 <code>risk_priority</code> 配置的优先级排序，数字越小优先级越高。同时触发多条时，取最高优先级的动作。</p>
+
+  <table>
+    <tr><th>优先级</th><th>规则</th><th>触发条件</th><th>动作</th></tr>
+    <tr><td>1</td><td>盈转亏</td><td>持仓从盈利转为亏损</td><td>减仓观察</td></tr>
+    <tr><td>2</td><td>初始止损</td><td>收盘价 &lt; 支撑价（近20日最低价）</td><td>止损清仓</td></tr>
+    <tr><td>3</td><td>S1/卖点</td><td>命中S1标签 且 当日跌幅 &lt; -2%</td><td>减仓</td></tr>
+    <tr><td>4</td><td>滴滴战法</td><td>收盘价 &lt; 前一日最低价<br>白线之上→减仓观察（可留1/2仓位）<br>白线之下→止损离场</td><td>减仓/止损</td></tr>
+    <tr><td>5</td><td>破白线</td><td>收盘价 &lt; 白线（知行趋势线）</td><td>减仓</td></tr>
+    <tr><td>6</td><td>破黄线</td><td>收盘价 &lt; 黄线（知行多空线）</td><td>清仓</td></tr>
+    <tr><td>7</td><td>MACD否决</td><td>MACD DIF &lt; 0 且 DIF &lt; DEA</td><td>否决开仓</td></tr>
+    <tr><td>8</td><td>放飞/止盈</td><td>价格 ≥ 压力位</td><td>止盈提示</td></tr>
+  </table>
+
+  <div class="note">
+    <p><strong>滴滴战法</strong>是分级止损策略：白线之上跌破前低→减仓观察（可留半仓）；白线之下跌破前低→止损离场。选股端的"滴滴战法"已改名为"缩量反弹"，仅作观察标签，不参与评分。</p>
+  </div>
+</section>
+
+<!-- ==================== 6. 交易计划 ==================== -->
+<section>
+  <h2 id="plan">6. 交易计划引擎</h2>
+
+  <p><code>TradePlanEngine.build_plan()</code> 是最终决策合成器，流程如下：</p>
+
+  <div class="flow-box">
+<pre><code>1. MarketTimingEngine.evaluate()  → 市场状态 MarketState
+2. EntrySignalEngine.evaluate()  → 入场信号列表 [Signal]
+3. RiskEngine.evaluate()        → 风控动作列表 [RiskAction]
+4. 按 allowed_signals 过滤信号（弱市仅允许特定信号）
+5. 取最高信号分数 vs pass_score 比较
+6. 按优先级输出 TradePlan</code></pre>
+  </div>
+
+  <h3>决策矩阵</h3>
+  <table>
+    <tr><th>条件</th><th>动作</th><th>仓位</th></tr>
+    <tr><td>有清仓/退出/否决级风控</td><td>清仓/退出</td><td>0%</td></tr>
+    <tr><td>有减仓级风控</td><td>减仓</td><td>单标的仓位÷2</td></tr>
+    <tr><td>熊市</td><td>观察/不开新仓</td><td>0%</td></tr>
+    <tr><td>震荡偏弱 + 信号达标</td><td>观察/仅B1轻仓</td><td>单标的5%</td></tr>
+    <tr><td>震荡偏弱 + 信号不足</td><td>观察/不开新仓</td><td>0%</td></tr>
+    <tr><td>震荡中性 + 信号达标</td><td>可纳入买入候选</td><td>单标的8%</td></tr>
+    <tr><td>震荡中性 + 有信号但不足</td><td>观察等待确认</td><td>单标的4%</td></tr>
+    <tr><td>震荡中性 + 无信号</td><td>无操作</td><td>0%</td></tr>
+    <tr><td>牛市/偏强 + 信号达标</td><td>可纳入买入候选</td><td>单标的12-20%</td></tr>
+    <tr><td>牛市/偏强 + 有信号不足</td><td>观察等待确认</td><td>单标的÷2</td></tr>
+    <tr><td>牛市/偏强 + 无信号</td><td>无操作</td><td>0%</td></tr>
+  </table>
+</section>
+
+<!-- ==================== 7. 指标公式 ==================== -->
+<section>
+  <h2 id="indicators">7. 指标公式体系</h2>
+
+  <h3>核心趋势线</h3>
+  <table>
+    <tr><th>指标</th><th>计算方式</th><th>用途</th></tr>
+    <tr><td>白线（知行趋势线 zxdq）</td><td>两层 EWM(10)：EMA(EMA(close, 10), 10)</td><td>短期趋势判断、破白线风控</td></tr>
+    <tr><td>黄线（知行多空线 zxdkx）</td><td>MA(14)、MA(28)、MA(57)、MA(114) 的平均</td><td>中长期趋势判断、破黄线清仓</td></tr>
+    <tr><td>BBI</td><td>(MA3 + MA6 + MA12 + MA24) / 4</td><td>多空判断</td></tr>
+    <tr><td>MA60</td><td>60日均线</td><td>中长期支撑</td></tr>
+    <tr><td>知行趋势达标</td><td>close &gt; zxdkx 且 zxdq &gt; zxdkx</td><td>B1/B2买点前置条件</td></tr>
+  </table>
+
+  <h3>支撑与压力</h3>
+  <ul>
+    <li>支撑价 = 近20日最低价</li>
+    <li>压力价 = 近20日最高价</li>
+    <li>距压力位 ≥ 2% 时加分</li>
+  </ul>
+
+  <h3>MACD</h3>
+  <ul>
+    <li>DIF = EMA(12) - EMA(26)</li>
+    <li>DEA = EMA(DIF, 9)</li>
+    <li>多头判定：DIF > 0（零轴上方）</li>
+    <li>否决条件：DIF &lt; 0 且 DIF &lt; DEA（死叉且零轴下）</li>
+  </ul>
+</section>
+
+<!-- ==================== 8. 图形质量 ==================== -->
+<section>
+  <h2 id="chart">8. 图形质量评分</h2>
+
+  <p><code>evaluate_chart_quality(df)</code> 基于K线形态特征评分0-100分，基准50分。</p>
+
+  <h3>加分项（上限+70）</h3>
+  <table class="score-table">
+    <tr><th>形态特征</th><th>加分</th></tr>
+    <tr><td>趋势一致性 MA5 &gt; MA10 &gt; MA20</td><td>+10</td></tr>
+    <tr><td>量价配合（上涨日均量 &gt; 下跌日均量且今日放量）</td><td>+10</td></tr>
+    <tr><td>近3日平均实体占比 &gt; 50%</td><td>+8</td></tr>
+    <tr><td>距MA20偏离度 &lt; 15%</td><td>+8</td></tr>
+    <tr><td>上影线 &lt; 实体50%</td><td>+8</td></tr>
+    <tr><td>近5日中阳线 ≥ 3根</td><td>+8</td></tr>
+    <tr><td>缩量回调后放量</td><td>+8</td></tr>
+    <tr><td>收盘 &gt; MA5 &gt; MA10</td><td>+5</td></tr>
+    <tr><td>近5日涨幅在0-5%之间</td><td>+5</td></tr>
+    <tr><td>下影线 &gt; 实体30%</td><td>+5</td></tr>
+  </table>
+
+  <h3>减分项（上限-40）</h3>
+  <table class="score-table">
+    <tr><th>形态特征</th><th>减分</th></tr>
+    <tr><td>长上影线</td><td>-10</td></tr>
+    <tr><td>放量滞涨</td><td>-8</td></tr>
+    <tr><td>近3日阴线 ≥ 2根</td><td>-8</td></tr>
+    <tr><td>高位放量</td><td>-8</td></tr>
+    <tr><td>跌破MA5</td><td>-5</td></tr>
+    <tr><td>单日涨幅 &gt; 8%</td><td>-5</td></tr>
+    <tr><td>巨量阴线</td><td>-5</td></tr>
+    <tr><td>开盘缺口 &gt; 3%</td><td>-5</td></tr>
+  </table>
+
+  <h3>评分加分配置</h3>
+  <table>
+    <tr><th>评级</th><th>分数区间</th><th>选股加分</th></tr>
+    <tr><td>优秀</td><td>≥ 80</td><td>+10</td></tr>
+    <tr><td>良好</td><td>≥ 60</td><td>+6</td></tr>
+    <tr><td>一般</td><td>40-59</td><td>0</td></tr>
+    <tr><td>较差</td><td>&lt; 40</td><td>-5</td></tr>
+  </table>
+</section>
+
+<!-- ==================== 9. 选股评分 ==================== -->
+<section>
+  <h2 id="scoring">9. 选股评分逻辑</h2>
+
+  <p><code>score_candidate()</code> 函数对每只候选股进行综合评分，评分项如下：</p>
+
+  <table class="score-table">
+    <tr><th>评分项</th><th>加分</th><th>条件</th></tr>
+    <tr><td>无风控否决</td><td>+22</td><td>未触发破白/破黄/MACD否决</td></tr>
+    <tr><td>有减仓级风控</td><td>-8</td><td>仅破白类风险</td></tr>
+    <tr><td>有清仓级风控</td><td>-28</td><td>清仓/否决类风险</td></tr>
+    <tr><td>站上白线和黄线</td><td>+18</td><td>close ≥ white_line 且 close ≥ yellow_line</td></tr>
+    <tr><td>MACD多头</td><td>+14</td><td>DIF > 0</td></tr>
+    <tr><td>B1/B2标签</td><td>+18</td><td>tags含"B1/B2买点"</td></tr>
+    <tr><td>砖形图反红</td><td>+16</td><td>tags含"砖形图"</td></tr>
+    <tr><td>单针战法</td><td>+12</td><td>tags含"单针战法"</td></tr>
+    <tr><td>BBI/MA60多头</td><td>+10</td><td>tags含"BBI/MA60"</td></tr>
+    <tr><td>知行趋势达标</td><td>+8</td><td>tags含"双线/白黄线"</td></tr>
+    <tr><td>放量长阳</td><td>+12</td><td>tags含"放量长阳"</td></tr>
+    <tr><td>锤头线</td><td>+10</td><td>tags含"锤头线"</td></tr>
+    <tr><td>回踩白线</td><td>+14</td><td>tags含"回踩白线"</td></tr>
+    <tr><td>突破压力</td><td>+13</td><td>tags含"突破压力"</td></tr>
+    <tr><td>量能放大</td><td>最高+10</td><td>量比 ≥ 1.2，每超0.1加0.8分</td></tr>
+    <tr><td>距压力位</td><td>最高+8</td><td>距压力位 ≥ 2%</td></tr>
+    <tr><td>图形质量</td><td>+10/+6/-5</td><td>按配置档位</td></tr>
+    <tr><td>板块强度（仅每日脚本）</td><td>+8/+4/-3</td><td>强势/中性/弱势</td></tr>
+  </table>
+
+  <h3>市场状态对评分的影响</h3>
+  <table>
+    <tr><th>状态</th><th>涨幅温和加分</th><th>特殊逻辑</th></tr>
+    <tr><td>弱市</td><td>+3</td><td>逆势抗跌+10；涨幅过大-5；非B1信号-5</td></tr>
+    <tr><td>中性</td><td>+6</td><td>小阳线+4；平盘抗跌+3</td></tr>
+    <tr><td>偏强/牛市</td><td>+8</td><td>小阳线+4</td></tr>
+  </table>
+
+  <h3>及格线（pass_score）</h3>
+  <table>
+    <tr><th>市场状态</th><th>及格分</th></tr>
+    <tr><td>牛市</td><td>50</td></tr>
+    <tr><td>震荡偏强</td><td>55</td></tr>
+    <tr><td>震荡中性</td><td>65</td></tr>
+    <tr><td>震荡偏弱</td><td>80</td></tr>
+    <tr><td>熊市</td><td>90</td></tr>
+  </table>
+  <p>候选数上限30只，按分数排序取前30。</p>
+</section>
+
+<!-- ==================== 10. 选股流程 ==================== -->
+<section>
+  <h2 id="pipeline">10. 选股流程</h2>
+
+  <h3>每日选股（screen_daily_candidates.py）</h3>
+  <div class="flow-box">
+<pre><code>1. 读取活跃市值 CSV
+2. 加载 Rulebook + TradePlanEngine
+3. 评估市场状态 → market_regime
+4. 加载实时行情 → 过滤股票池
+5. 预筛（prefilter_for_history）
+   ├ 弱市：成交额≥5000万，涨跌幅-3%~+5%，选抗跌股
+   ├ 中性：成交额≥5000万，涨跌幅-1%~+7%，放宽要求
+   └ 偏强：成交额≥5000万，涨跌幅0%~+8.8%，选上涨股
+   → 按成交额45%+涨跌幅30%+位置25%评分，取前220只
+6. 加载板块数据
+7. 线程池并发处理（10线程）：
+   fetch_daily → build_snapshot → build_plan → evaluate_chart_quality → score_candidate
+8. 过滤低于及格线的股票
+9. 排序取 Top30
+10. 输出 CSV + HTML + JSON
+11. 保存历史备份到 outputs/history/
+12. 写入 SQLite 数据库
+13. Agent 审核（可选）</code></pre>
+  </div>
+
+  <h3>周一选股（screen_next_monday_candidates.py）</h3>
+  <p>与每日选股流程基本一致，区别：</p>
+  <ul>
+    <li>无板块强度加分</li>
+    <li>无 Agent 审核</li>
+    <li>无 SQLite 持久化</li>
+    <li>支持 <code>--market-override</code> 手动覆盖市场状态</li>
+    <li>同时输出 <code>daily_candidates.*</code> 和 <code>next_monday_candidates.*</code> 兼容文件</li>
+  </ul>
+</section>
+
+<!-- ==================== 11. 配置总表 ==================== -->
+<section>
+  <h2 id="config">11. 配置参数总表</h2>
+
+  <p>所有规则参数集中在 <code>config/rulebook.json</code>，通过 <code>Rulebook</code> 类读取。</p>
+
+  <h3>市场时机（market_timing）</h3>
+  <table>
+    <tr><th>参数</th><th>值</th><th>说明</th></tr>
+    <tr><td>bull_threshold</td><td>4.0%</td><td>牛市活跃市值阈值</td></tr>
+    <tr><td>bear_threshold</td><td>-2.3%</td><td>熊市活跃市值阈值</td></tr>
+    <tr><td>neutral_strong_threshold</td><td>1.0%</td><td>震荡偏强阈值</td></tr>
+    <tr><td>neutral_weak_threshold</td><td>-0.5%</td><td>震荡偏弱阈值</td></tr>
+    <tr><td>bull_3day_cumulative_threshold</td><td>4.0%</td><td>3日累计多头阈值</td></tr>
+    <tr><td>macd_zero_axis_required_for_aggressive</td><td>true</td><td>进攻需MACD零轴上方</td></tr>
+  </table>
+
+  <h3>仓位策略（position_policy）</h3>
+  <table>
+    <tr><th>状态</th><th>最大仓位</th><th>单标的</th><th>允许B2</th></tr>
+    <tr><td>BULL</td><td>80%</td><td>20%</td><td>是</td></tr>
+    <tr><td>NEUTRAL_STRONG</td><td>50%</td><td>12%</td><td>是</td></tr>
+    <tr><td>NEUTRAL_BALANCED</td><td>35%</td><td>8%</td><td>否</td></tr>
+    <tr><td>NEUTRAL_WEAK</td><td>20%</td><td>5%</td><td>否</td></tr>
+    <tr><td>BEAR</td><td>10%</td><td>3%</td><td>否</td></tr>
+  </table>
+
+  <h3>信号评分（signal_scoring）</h3>
+  <table>
+    <tr><th>配置项</th><th>说明</th></tr>
+    <tr><td>signal_bonus</td><td>单个信号加分（B1/B2候选+10，关键K放量+8）</td></tr>
+    <tr><td>combo_bonus</td><td>12种组合信号加分（最高+18）</td></tr>
+    <tr><td>regime_adjustment</td><td>5种市场状态惩罚（0/-5/-12/-25）</td></tr>
+    <tr><td>regime_signal_filter</td><td>弱市仅允许特定信号通过</td></tr>
+    <tr><td>pass_score</td><td>全局及格线50</td></tr>
+    <tr><td>pass_score_by_regime</td><td>按状态及格线（50/55/65/80/90）</td></tr>
+    <tr><td>chart_quality_bonus</td><td>图形质量加分（优秀+10/良好+6/较差-5）</td></tr>
+  </table>
+
+  <h3>回测配置（backtest）</h3>
+  <table>
+    <tr><th>参数</th><th>值</th></tr>
+    <tr><td>止损</td><td>5%</td></tr>
+    <tr><td>止盈</td><td>10%</td></tr>
+    <tr><td>最大持仓期</td><td>10天</td></tr>
+    <tr><td>滑点</td><td>0.3%</td></tr>
+    <tr><td>佣金</td><td>万2.5</td></tr>
+    <tr><td>印花税</td><td>千0.5</td></tr>
+    <tr><td>风控引擎</td><td>启用</td></tr>
+  </table>
+</section>
+
+<!-- ==================== 12. 数据持久化 ==================== -->
+<section>
+  <h2 id="storage">12. 数据持久化</h2>
+
+  <p>SQLite 数据库 <code>data/trading_system.db</code>，共15张表：</p>
+
+  <table>
+    <tr><th>表名</th><th>用途</th></tr>
+    <tr><td>market_state</td><td>每日市场状态记录</td></tr>
+    <tr><td>daily_candidates</td><td>每日候选股票（27字段）</td></tr>
+    <tr><td>agent_reviews</td><td>Agent审核结果</td></tr>
+    <tr><td>trade_plans</td><td>交易计划</td></tr>
+    <tr><td>market_snapshots</td><td>行情快照</td></tr>
+    <tr><td>candidate_reviews</td><td>候选复盘</td></tr>
+    <tr><td>review_stats</td><td>复盘统计</td></tr>
+    <tr><td>holdings</td><td>持仓（id, symbol, name, buy_date, buy_price, shares, cost_price, commission, status, note, created_at）</td></tr>
+    <tr><td>transactions</td><td>交易记录（含pnl, pnl_pct）</td></tr>
+    <tr><td>sim_accounts</td><td>模拟交易账户</td></tr>
+    <tr><td>sim_holdings</td><td>模拟交易持仓</td></tr>
+    <tr><td>sim_transactions</td><td>模拟交易记录</td></tr>
+    <tr><td>sim_nav_history</td><td>模拟交易净值曲线</td></tr>
+  </table>
+
+  <h3>模拟交易规则</h3>
+  <ul>
+    <li>全买模式：每只入选股票各买1万元，排除"无操作/不开新仓"的股票</li>
+    <li>买入价：选股日次日开盘价（含滑点）</li>
+    <li>卖出价：信号触发日当日收盘价（含滑点）</li>
+    <li>交易费用：佣金万2.5、印花税千0.5</li>
+  </ul>
+</section>
+
+<!-- ==================== 附录 ==================== -->
+<section>
+  <h2>附录：每日一键执行流程</h2>
+  <div class="note">
+    <p><strong>执行顺序：</strong>刷新市场数据 → 检查持仓（生成卖出建议） → 复盘昨日候选 → 生成今日候选 → 运行模拟交易</p>
+    <p><strong>运行约束：</strong>5-8分钟运行时间，按钮禁用，实时进度显示</p>
+    <p><strong>持仓模块：</strong>独立运行，不集成到一键执行流程中</p>
+  </div>
+
+  <h2>附录：Web面板布局</h2>
+  <ul>
+    <li>6个Tab页：仪表盘、选股执行、持仓管理、报告与历史、运行日志、模拟交易</li>
+    <li>顶部运行状态栏（运行/空闲、任务名、退出码）全局可见</li>
+    <li>仪表盘和选股执行页：双向同步的市场状态覆盖下拉框</li>
+    <li>持仓管理页：持仓表格 + 增减删按钮 + 交易历史</li>
+    <li>模拟交易页：账户状态卡片 + 持仓表格 + 净值曲线 + 交易记录 + 操作按钮</li>
+  </ul>
+</section>
+
+</main>
+</body>
+</html>

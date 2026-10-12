@@ -29,13 +29,53 @@ STATE = {
 STATE_LOCK = threading.Lock()
 
 
+def _run_subprocess_with_timeout(cmd: list[str], cwd: Path, timeout: int, log_prefix: str = "") -> int:
+    """启动子进程，实时转发 stdout 到日志，带真正超时保护。
+    
+    用 daemon 线程读 stdout，主线程调 proc.wait(timeout=...)，
+    避免 `for line in proc.stdout` 阻塞导致 timeout 不生效。
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except Exception as exc:
+        _append_log(f"启动失败：{exc}")
+        return -1
+
+    def _reader():
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            _append_log(line)
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+
+    try:
+        code = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _append_log(f"{log_prefix}超时（{timeout}s），已终止。")
+        code = -1
+
+    reader.join(timeout=5)
+    return code
+
+
 COMMANDS = {
     "refresh_spot": {
         "name": "刷新全市场实时行情缓存",
         "cmd": [
             sys.executable,
             "-c",
-            "import akshare as ak; df=ak.stock_zh_a_spot(); df.to_csv('data/a_spot_latest.csv', index=False, encoding='utf-8-sig'); print('已输出 data/a_spot_latest.csv，股票数：', len(df))",
+            "import os; os.environ['TQDM_DISABLE']='1'; import akshare as ak; df=ak.stock_zh_a_spot(); df.to_csv('data/a_spot_latest.csv', index=False, encoding='utf-8-sig'); print('已输出 data/a_spot_latest.csv，股票数：', len(df))",
         ],
     },
     "daily_report": {
@@ -645,24 +685,7 @@ def _run_action(action: str, market_override: str = None) -> None:
             "log": [f"开始：{item['name']}"],
         })
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=PROJECT_ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            _append_log(line)
-        code = proc.wait()
-    except Exception as exc:
-        code = -1
-        _append_log(f"执行失败：{exc}")
+    code = _run_subprocess_with_timeout(cmd, PROJECT_ROOT, 300, item["name"])
 
     with STATE_LOCK:
         STATE.update({
@@ -688,40 +711,32 @@ def _run_daily_workflow(market_override: str = None) -> None:
         })
 
     overall_code = 0
+    STEP_TIMEOUTS = {
+        "refresh_spot": 60,
+        "review_candidates": 120,
+        "screen_candidates": 360,
+        "simulation": 60,
+    }
     for idx, step in enumerate(steps, 1):
         item = COMMANDS[step]
         cmd = list(item["cmd"])
         if market_override and step == "screen_candidates":
             cmd.extend(["--market-override", market_override])
+        step_timeout = STEP_TIMEOUTS.get(step, 180)
         with STATE_LOCK:
             STATE["action"] = f"{DAILY_WORKFLOW['name']} - 第{idx}/{total}步：{item['name']}"
-            STATE["log"].append(f"--- 第{idx}/{total}步：{item['name']} ---")
+            STATE["log"].append(f"--- 第{idx}/{total}步：{item['name']}（超时{step_timeout}s）---")
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=PROJECT_ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            )
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                _append_log(line)
-            code = proc.wait()
-        except Exception as exc:
-            code = -1
-            _append_log(f"执行失败：{exc}")
+        step_start = time.time()
+        code = _run_subprocess_with_timeout(cmd, PROJECT_ROOT, step_timeout, f"第{idx}步")
 
+        elapsed = time.time() - step_start
         if code != 0:
             overall_code = code
-            _append_log(f"第{idx}步「{item['name']}」失败，退出码：{code}，暂停后续步骤。")
+            _append_log(f"第{idx}步「{item['name']}」失败(退出码{code})，耗时{elapsed:.0f}s，暂停后续步骤。")
             break
         else:
-            _append_log(f"第{idx}步「{item['name']}」完成。")
+            _append_log(f"第{idx}步「{item['name']}」完成，耗时{elapsed:.0f}s。")
 
     with STATE_LOCK:
         STATE.update({

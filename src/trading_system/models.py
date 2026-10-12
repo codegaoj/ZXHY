@@ -84,6 +84,7 @@ class SecuritySnapshot:
     support_price: float
     resistance_price: float
     tags: List[str] = field(default_factory=list)
+    signals: Dict[str, bool] = field(default_factory=dict)
     recent_active_market_values: List[float] = field(default_factory=list)
 
     @property

@@ -130,25 +130,29 @@ class EntrySignalEngine:
     def evaluate(self, snapshot: SecuritySnapshot, market: MarketState) -> List[Signal]:
         signals: List[Signal] = []
         score = sum(self.rulebook.tag_score(tag) for tag in snapshot.tags)
+        bonus_map = self.rulebook.signal_bonus
+        combo_map = self.rulebook.combo_bonus
 
         if "B1/B2买点" in snapshot.tags and indicators.near_support(snapshot):
+            bonus = bonus_map.get("B1/B2候选", 10)
             signals.append(Signal(
                 symbol=snapshot.symbol,
                 name=snapshot.name,
                 direction=SignalDirection.ENTRY,
                 signal_type="B1/B2候选",
-                score=score + 10,
+                score=score + bonus,
                 reason="样本标签命中 B1/B2，且价格接近支撑位。",
                 evidence={"support_price": snapshot.support_price, "close": snapshot.close},
             ))
 
         if "关键K" in snapshot.tags and indicators.is_volume_breakout(snapshot):
+            bonus = bonus_map.get("关键K放量", 8)
             signals.append(Signal(
                 symbol=snapshot.symbol,
                 name=snapshot.name,
                 direction=SignalDirection.ENTRY,
                 signal_type="关键K放量",
-                score=score + 8,
+                score=score + bonus,
                 reason="关键K标签命中，且量比放大、价格上涨。",
                 evidence={"volume_ratio": round(snapshot.volume_ratio, 2), "pct_change": round(snapshot.pct_change, 2)},
             ))
@@ -164,14 +168,27 @@ class EntrySignalEngine:
                 evidence={"white_line": snapshot.white_line, "yellow_line": snapshot.yellow_line},
             ))
 
-        if market.regime == MarketRegime.BEAR:
+        for combo_name, bonus in combo_map.items():
+            parts = combo_name.split("+", 1)
+            if len(parts) == 2 and parts[0] in snapshot.signals and parts[1] in snapshot.signals:
+                if snapshot.signals.get(parts[0]) and snapshot.signals.get(parts[1]):
+                    signals.append(Signal(
+                        symbol=snapshot.symbol,
+                        name=snapshot.name,
+                        direction=SignalDirection.ENTRY,
+                        signal_type=f"组合:{combo_name}",
+                        score=score + bonus,
+                        reason=f"组合信号 {combo_name} 同时触发，加分 {bonus}。",
+                        evidence={"combo": combo_name, "signal_a": parts[0], "signal_b": parts[1]},
+                    ))
+
+        regime_name = market.regime.name
+        penalty = self.rulebook.regime_penalty(regime_name)
+        if penalty != 0:
+            desc = self.rulebook.regime_description(regime_name)
             for signal in signals:
-                signal.score = max(0, signal.score - 25)
-                signal.reason += " 但市场处于空头区间，进攻分数下调。"
-        elif market.regime == MarketRegime.NEUTRAL_WEAK:
-            for signal in signals:
-                signal.score = max(0, signal.score - 12)
-                signal.reason += " 震荡偏弱区间，进攻分数适度下调。"
+                signal.score = max(0, signal.score + penalty)
+                signal.reason += f" {desc}，分数调整{penalty:+d}。"
 
         return signals
 
@@ -265,6 +282,7 @@ class RiskEngine:
 
 class TradePlanEngine:
     def __init__(self, rulebook: Rulebook):
+        self.rulebook = rulebook
         self.market_engine = MarketTimingEngine(rulebook)
         self.entry_engine = EntrySignalEngine(rulebook)
         self.risk_engine = RiskEngine(rulebook)
@@ -279,8 +297,25 @@ class TradePlanEngine:
         entry_signals = self.entry_engine.evaluate(snapshot, market)
         risk_actions = self.risk_engine.evaluate(snapshot)
 
+        regime_name = market.regime.name
+        allowed = set(self.rulebook.allowed_signals(regime_name))
+        if allowed:
+            filtered = [s for s in entry_signals if any(
+                sig in s.signal_type or sig in s.reason for sig in allowed
+            )]
+            blocked = [s for s in entry_signals if s not in filtered]
+            if blocked:
+                entry_signals = filtered
+                blocked_names = [s.signal_type for s in blocked]
+                notes_preview = f"环境过滤：{regime_name}仅允许 {list(allowed)}，已过滤 {blocked_names}。"
+        else:
+            notes_preview = None
+
         score = max([signal.score for signal in entry_signals], default=0)
+        pass_score = self.rulebook.pass_score_for_regime(regime_name)
         notes = [market.reason]
+        if notes_preview:
+            notes.append(notes_preview)
 
         if risk_actions:
             top_risk = risk_actions[0]
@@ -292,7 +327,7 @@ class TradePlanEngine:
             suggested_position_pct = 0
             notes.append("空头区间不因买点信号主动进攻。")
         elif market.regime == MarketRegime.NEUTRAL_WEAK:
-            if score >= 55:
+            if score >= pass_score:
                 action = "观察/仅B1轻仓"
                 suggested_position_pct = market.single_symbol_pct
                 notes.append("震荡偏弱，仅B1信号可轻仓试探，快进快出。")
@@ -301,7 +336,7 @@ class TradePlanEngine:
                 suggested_position_pct = 0
                 notes.append("震荡偏弱，信号不足，保守观望。")
         elif market.regime == MarketRegime.NEUTRAL_BALANCED:
-            if score >= 55:
+            if score >= pass_score:
                 action = "可纳入买入候选"
                 suggested_position_pct = market.single_symbol_pct
                 notes.append("震荡中性，B1信号可参与，注意仓位控制。")
@@ -313,7 +348,7 @@ class TradePlanEngine:
                 action = "无操作"
                 suggested_position_pct = 0
                 notes.append("震荡中性，未出现足够清晰的进攻信号。")
-        elif score >= 55:
+        elif score >= pass_score:
             action = "可纳入买入候选"
             suggested_position_pct = market.single_symbol_pct
             notes.append("进攻信号较强，但仍需人工复核图形。")

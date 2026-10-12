@@ -31,9 +31,9 @@ from trading_system.trade_calendar import last_trading_day
 
 DEFAULT_ACTIVE_MARKET_VALUE_PCT = 4.82
 HISTORY_DAYS = 180
-PREFILTER_LIMIT = 220
-MAX_WORKERS = 10
-TOP_N = 40
+PREFILTER_LIMIT = 150
+MAX_WORKERS = 20
+TOP_N = 30
 
 _process_errors: list[str] = []
 
@@ -316,10 +316,10 @@ def fetch_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
                 start_date=start_date,
                 end_date=end_date,
                 adjust="qfq",
-                timeout=8,
+                timeout=12,
             ),
-            times=1,
-            pause=0.5,
+            times=2,
+            pause=0.3,
         )
         return _normalize_cols(df)
     except Exception as exc:
@@ -331,10 +331,10 @@ def fetch_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
                 start_date=start_date,
                 end_date=end_date,
                 adjust="qfq",
-                timeout=8,
+                timeout=10,
             ),
             times=1,
-            pause=0.5,
+            pause=0.3,
         )
         return _normalize_cols(df)
     except Exception as exc:
@@ -348,7 +348,7 @@ def fetch_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
                 adjust="qfq",
             ),
             times=1,
-            pause=0.5,
+            pause=0.3,
         )
         return _normalize_cols(df)
     except Exception as exc:
@@ -368,7 +368,7 @@ def signal_text(plan) -> str:
     return "；".join(f"{sig.signal_type}:{sig.reason}" for sig in plan.entry_signals)
 
 
-def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50, market_regime: str = "neutral_strong") -> tuple[float, str]:
+def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50, market_regime: str = "neutral_strong", rulebook=None) -> tuple[float, str]:
     close_above_lines = snapshot.close >= snapshot.white_line and snapshot.close >= snapshot.yellow_line
     macd_ok = is_macd_bullish(snapshot)
     no_risk = len(plan.risk_actions) == 0
@@ -472,15 +472,21 @@ def score_candidate(snapshot, plan, spot_row, chart_quality_score: int = 50, mar
             reasons.append(f"距压力位约 {distance_to_resistance:.1f}%")
 
     # ---- 图形质量评分加分 ----
-    if chart_quality_score >= 80:
-        score += 10
-        reasons.append(f"图形质量优秀({chart_quality_score}分)")
-    elif chart_quality_score >= 60:
-        score += 6
-        reasons.append(f"图形质量良好({chart_quality_score}分)")
-    elif chart_quality_score < 40:
-        score -= 5
-        reasons.append(f"图形质量较差({chart_quality_score}分)")
+    if rulebook is not None:
+        bonus, label = rulebook.chart_quality_adjustment(chart_quality_score)
+    else:
+        if chart_quality_score >= 80:
+            bonus, label = 10, f"图形质量优秀({chart_quality_score}分)"
+        elif chart_quality_score >= 60:
+            bonus, label = 6, f"图形质量良好({chart_quality_score}分)"
+        elif chart_quality_score < 40:
+            bonus, label = -5, f"图形质量较差({chart_quality_score}分)"
+        else:
+            bonus, label = 0, ""
+    if bonus != 0:
+        score += bonus
+        if label:
+            reasons.append(label)
 
     # ---- 弱市标记低分 ----
     if is_weak and score < 30:
@@ -503,7 +509,7 @@ def process_one(row: dict, engine: TradePlanEngine, start_date: str, end_date: s
         if float(row.get("amount", 0) or 0) <= 0:
             row["pct_change"] = snapshot.pct_change
             row["amount"] = 0.0
-        candidate_score, candidate_reason = score_candidate(snapshot, plan, row, cq.score, market_regime=market_regime)
+        candidate_score, candidate_reason = score_candidate(snapshot, plan, row, cq.score, market_regime=market_regime, rulebook=engine.rulebook)
         # ---- 板块强度加分 ----
         sector_info = get_sector_info(symbol, sector_mapping or {}, sector_performance or {})
         sector_bonus = sector_strength_score(sector_info)
@@ -685,23 +691,27 @@ def main():
     print(f"[市场状态] {market_state.regime.value} | 活跃市值 {active_market_value_pct:.2f}% | 仓位上限 {market_state.max_position_pct}% | {'手动覆盖' if market_state.manual_override else '自动评估'}")
     print(f"[市场状态] {market_state.reason}")
 
+    t0 = time.time()
     spot = load_spot()
     pool = filter_pool(spot)
     watchlist_path = save_watchlist(pool)
     config_path = save_config()
     pre = prefilter_for_history(pool, market_regime=market_regime)
+    print(f"[计时] 行情加载+预筛选: {time.time()-t0:.1f}s (预筛 {len(pre)} 只)")
 
     end = last_trading_day()
     start = end - timedelta(days=HISTORY_DAYS + 30)
     start_date = start.strftime("%Y%m%d")
     end_date = end.strftime("%Y%m%d")
 
+    t1 = time.time()
     print("正在加载板块数据...")
     supplement_symbols = [str(r.get("symbol", "")).strip().zfill(6) for r in pre.to_dict("records")]
     sector_mapping = build_sector_mapping(PROJECT_ROOT / "data" / "sector_mapping.csv", supplement_symbols=supplement_symbols)
     sector_performance = fetch_sector_performance()
-    print(f"板块映射: {len(sector_mapping)} 只股票, 行业表现: {len(sector_performance)} 个板块")
+    print(f"[计时] 板块数据: {time.time()-t1:.1f}s | 板块映射: {len(sector_mapping)} 只, 行业表现: {len(sector_performance)} 个")
 
+    t2 = time.time()
     rows = []
     _process_errors.clear()
     records = pre.to_dict("records")
@@ -712,7 +722,8 @@ def main():
             if result:
                 rows.append(result)
             if idx % 50 == 0:
-                print(f"已计算 {idx}/{len(records)}，候选 {len(rows)}")
+                print(f"已计算 {idx}/{len(records)}，候选 {len(rows)}（耗时 {time.time()-t2:.1f}s）")
+    print(f"[计时] 日线拉取+指标计算: {time.time()-t2:.1f}s ({len(records)} 只, {MAX_WORKERS} 线程)")
 
     error_count = len(_process_errors)
     low_score_count = len(records) - len(rows) - error_count
@@ -760,30 +771,8 @@ def main():
     shutil.copyfile(daily_html, dated_html)
     print(f"[历史] 已保存 {today_str} 的候选股记录到 history/ 目录")
 
-    # ---- SQLite 持久化 ----
-    try:
-        with Storage() as db:
-            db.save_market_state(
-                state_date=today_str,
-                regime=market_state.regime.value,
-                active_market_value_pct=active_market_value_pct,
-                macd_above_zero=recent_values[-1] > 0 if recent_values else False,
-                reason=market_state.reason,
-                max_position_pct=market_state.max_position_pct,
-                single_symbol_pct=market_state.single_symbol_pct,
-                manual_override=market_state.manual_override,
-            )
-            db.save_daily_candidates(today_str, rows)
-            print(f"[DB] 已入库 {today_str} 的市场状态 + {len(rows)} 条候选股")
-    except Exception as exc:
-        print(f"[DB] 入库失败（不影响主流程）：{exc}")
-
-    # 兼容旧版链接，避免之前的报告入口失效。
-    shutil.copyfile(daily_csv, outputs / "next_monday_candidates.csv")
-    shutil.copyfile(daily_html, outputs / "next_monday_candidates.html")
-    shutil.copyfile(daily_json, outputs / "next_monday_candidates.json")
-
     # ---- Agent 辅助审核 ----
+    review_data = None
     try:
         batch = review_candidates(rows)
         review_data = {
@@ -819,24 +808,38 @@ def main():
         print(f"  建议关注: {opinion_counts.get('建议关注', 0)}  谨慎: {opinion_counts.get('谨慎', 0)}  排除: {opinion_counts.get('排除', 0)}")
     except Exception as e:
         print(f"Agent 审核失败: {e}")
-    else:
-        # Agent 审核结果入库
-        try:
-            agent_rows = [
-                {
-                    "symbol": r["symbol"],
-                    "verdict": r.get("opinion"),
-                    "score": r.get("score"),
-                    "issues": r.get("issues"),
-                    "recommendation": r.get("brief"),
-                }
-                for r in review_data["reviews"]
-            ]
-            with Storage() as db:
+
+    # ---- SQLite 持久化（统一一次连接） ----
+    try:
+        with Storage() as db:
+            db.save_market_state(
+                state_date=today_str,
+                regime=market_state.regime.value,
+                active_market_value_pct=active_market_value_pct,
+                macd_above_zero=recent_values[-1] > 0 if recent_values else False,
+                reason=market_state.reason,
+                max_position_pct=market_state.max_position_pct,
+                single_symbol_pct=market_state.single_symbol_pct,
+                manual_override=market_state.manual_override,
+            )
+            db.save_daily_candidates(today_str, rows)
+            print(f"[DB] 已入库 {today_str} 的市场状态 + {len(rows)} 条候选股")
+
+            if review_data is not None:
+                agent_rows = [
+                    {
+                        "symbol": r["symbol"],
+                        "verdict": r.get("opinion"),
+                        "score": r.get("score"),
+                        "issues": r.get("issues"),
+                        "recommendation": r.get("brief"),
+                    }
+                    for r in review_data["reviews"]
+                ]
                 db.save_agent_reviews(today_str, agent_rows)
                 print(f"[DB] 已入库 {len(agent_rows)} 条 Agent 审核")
-        except Exception as exc:
-            print(f"[DB] Agent 审核入库失败：{exc}")
+    except Exception as exc:
+        print(f"[DB] 入库失败（不影响主流程）：{exc}")
 
     print(json.dumps({"stats": stats, "candidate_count": len(rows), "top": rows[:10]}, ensure_ascii=False, indent=2))
 

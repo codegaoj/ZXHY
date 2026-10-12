@@ -42,5 +42,73 @@
     "仓位/风控": {"direction": "risk", "base_score": 15},
     "MACD": {"direction": "veto", "base_score": 15},
     "BBI/MA60": {"direction": "context", "base_score": 6}
+  },
+  "signal_scoring": {
+    "signal_bonus": {
+      "B1/B2候选": 10,
+      "关键K放量": 8
+    },
+    "combo_bonus": {
+      "B1买点+回踩白线": 15,
+      "B1买点+缩量反弹": 18,
+      "B1买点+砖型图反红": 12,
+      "单针下20+回踩白线": 12,
+      "单针下20+缩量反弹": 10,
+      "砖型图反红+回踩白线": 10,
+      "砖型图反红+缩量反弹": 8,
+      "回踩白线+缩量反弹": 8
+    },
+    "regime_adjustment": {
+      "BULL": {"penalty": 0, "description": "多头进攻"},
+      "NEUTRAL_STRONG": {"penalty": 0, "description": "震荡偏强，组合信号替代单战法"},
+      "NEUTRAL_BALANCED": {"penalty": -5, "description": "震荡中性，仅强组合可用"},
+      "NEUTRAL_WEAK": {"penalty": -12, "description": "震荡偏弱，仓位压缩"},
+      "BEAR": {"penalty": -25, "description": "空头区间，进攻分数大幅下调"}
+    },
+    "regime_signal_filter": {
+      "BULL": ["B1买点", "B2买点", "B1买点+回踩白线", "B1买点+缩量反弹"],
+      "NEUTRAL_STRONG": ["砖型图反红+回踩白线", "回踩白线+缩量反弹", "突破压力", "缩量反弹+突破压力"],
+      "NEUTRAL_BALANCED": ["单针下20+回踩白线", "B1买点+锤头线"],
+      "NEUTRAL_WEAK": ["B1买点+砖型图反红", "单针下20"],
+      "BEAR": ["单针下20+锤头线", "单针下20", "砖型图反红"]
+    },
+    "pass_score": 50,
+    "pass_score_by_regime": {
+      "BULL": 50,
+      "NEUTRAL_STRONG": 55,
+      "NEUTRAL_BALANCED": 65,
+      "NEUTRAL_WEAK": 80,
+      "BEAR": 90
+    },
+    "chart_quality_bonus": {
+      "excellent_threshold": 80,
+      "excellent_bonus": 10,
+      "good_threshold": 60,
+      "good_bonus": 6,
+      "poor_threshold": 40,
+      "poor_penalty": -5
+    }
+  },
+  "backtest": {
+    "stop_loss_pct": 0.05,
+    "take_profit_pct": 0.10,
+    "max_hold_days": 10,
+    "slippage": 0.003,
+    "use_risk_engine": true,
+    "strategies": ["B1买点", "B2买点", "单针下20", "砖型图反红"],
+    "combos": [
+      ["B1买点", "回踩白线"],
+      ["B1买点", "缩量反弹"],
+      ["B1买点", "砖型图反红"],
+      ["单针下20", "回踩白线"],
+      ["单针下20", "缩量反弹"],
+      ["砖型图反红", "回踩白线"],
+      ["砖型图反红", "缩量反弹"],
+      ["回踩白线", "缩量反弹"],
+      ["回踩白线", "突破压力"],
+      ["缩量反弹", "突破压力"],
+      ["B1买点", "锤头线"],
+      ["单针下20", "锤头线"]
+    ]
   }
 }
